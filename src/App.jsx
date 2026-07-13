@@ -2,6 +2,7 @@ import { Canvas } from '@react-three/fiber'
 import { OrbitControls, useGLTF, Bounds, Center } from '@react-three/drei'
 import { Suspense, useState, useRef, useEffect } from 'react'
 import * as THREE from 'three'
+import { classifyMuscleGroup, MUSCLE_GROUPS } from './muscleData'
 
 function Model({ url, opacity }) {
   const { scene } = useGLTF(url)
@@ -21,6 +22,11 @@ function Model({ url, opacity }) {
       if (child.isMesh) {
         child.material = child.material.clone()
         child.material.transparent = true
+
+        const group = classifyMuscleGroup(child.name)
+        if (group && MUSCLE_GROUPS[group]) {
+          child.material.color = new THREE.Color(MUSCLE_GROUPS[group].color)
+        }
       }
     })
   }
