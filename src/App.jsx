@@ -1,6 +1,6 @@
 import { Canvas, useFrame, useThree } from '@react-three/fiber'
 import { Bounds, Center, OrbitControls, useGLTF } from '@react-three/drei'
-import { Suspense, useEffect, useMemo, useRef, useState } from 'react'
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import * as THREE from 'three'
 import {
   classifyMuscleGroup,
@@ -12,18 +12,35 @@ const MODEL_SIZE = 2
 const NO_RAYCAST = () => {}
 const WHITE = new THREE.Color('#ffffff')
 
-// AI command bar: talks to the backend in /server, which calls the
-// Anthropic API with tool definitions and gets back tool_use blocks
-// (see server/index.js for the exact tool schemas).
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8787'
 
-// A stand-in for a real Claude API response, so the command bar can be
-// tried out before ANTHROPIC_API_KEY is set up. This is the same shape
-// server/index.js forwards for a real request: Claude's raw `content`
-// array, with a short text block before each tool_use block. Wired to
-// the "Try example" button below. Pretend prompt: "focus the right
-// biceps, hide both hamstrings, then unhide the left one, and color
-// the right quads red" — each step below runs one at a time.
+const MODEL_CONFIGS = [
+  {
+    key: 'bones',
+    label: 'Bones',
+    sourceLabel: 'Skeleton',
+    url: '/skeleton.glb',
+    defaultCategory: 'Bone',
+    initialOpacity: 1,
+  },
+  {
+    key: 'muscles',
+    label: 'Muscles',
+    sourceLabel: 'Muscle model',
+    url: '/anatomy.glb',
+    defaultCategory: 'Muscle',
+    initialOpacity: 0.75,
+  },
+  {
+    key: 'joints',
+    label: 'Joints & ligaments',
+    sourceLabel: 'Joint model',
+    url: '/joints.glb',
+    defaultCategory: null,
+    initialOpacity: 1,
+  },
+]
+
 const EXAMPLE_RESPONSE = {
   content: [
     { type: 'text', text: 'Focusing the right biceps.' },
@@ -35,7 +52,11 @@ const EXAMPLE_RESPONSE = {
     { type: 'text', text: 'Actually, showing the left hamstring again.' },
     { type: 'tool_use', name: 'show_muscle', input: { muscle: 'left biceps femoris' } },
     { type: 'text', text: 'Coloring the right quads red.' },
-    { type: 'tool_use', name: 'set_muscle_color', input: { muscle: 'right rectus femoris', color: '#ef4444' } },
+    {
+      type: 'tool_use',
+      name: 'set_muscle_color',
+      input: { muscle: 'right rectus femoris', color: '#ef4444' },
+    },
   ],
 }
 
@@ -103,70 +124,155 @@ const styles = {
 }
 
 function getMaterials(mesh) {
-  return Array.isArray(mesh.material) ? mesh.material : [mesh.material]
+  if (!mesh.material) return []
+  return Array.isArray(mesh.material) ? mesh.material.filter(Boolean) : [mesh.material]
 }
 
-function formatMuscleName(name) {
-  const words = name
-    .replace(/[_-]+/g, ' ')
+function cloneMeshMaterials(mesh) {
+  const materials = getMaterials(mesh).map((material) => material.clone())
+  mesh.material = Array.isArray(mesh.material) ? materials : materials[0]
+}
+
+function formatStructureName(name) {
+  if (!name) return 'Unnamed structure'
+
+  let cleaned = name.trim()
+  let side = ''
+
+  if (/\.r$/i.test(cleaned)) {
+    cleaned = cleaned.replace(/\.r$/i, '')
+    side = 'Right'
+  } else if (/\.l$/i.test(cleaned)) {
+    cleaned = cleaned.replace(/\.l$/i, '')
+    side = 'Left'
+  } else {
+    cleaned = cleaned.replace(/\.g$/i, '')
+  }
+
+  const words = cleaned
+    .replace(/_+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim()
     .split(' ')
 
-  return words
+  const title = words
     .map((word, index) => {
       const lower = word.toLowerCase()
       if (index > 0 && ['of', 'and', 'the'].includes(lower)) return lower
       return lower.charAt(0).toUpperCase() + lower.slice(1)
     })
     .join(' ')
+
+  return side ? `${side} ${title}` : title
 }
 
-// Matches a name from the AI (e.g. "left biceps brachii") to a loaded
-// muscle record, using the same matching approach as the search box.
-function resolveMuscle(muscleList, query) {
-  if (!query) return null
-  const q = query.trim().toLowerCase()
-  if (!q) return null
+function getHierarchyText(object) {
+  const names = []
+  let current = object
 
-  const candidates = muscleList.filter(
-    (muscle) => muscle.searchName.includes(q) || muscle.name.toLowerCase().includes(q)
-  )
-  if (!candidates.length) return null
-
-  candidates.sort((a, b) => {
-    const aStarts = a.searchName.startsWith(q)
-    const bStarts = b.searchName.startsWith(q)
-    if (aStarts !== bStarts) return aStarts ? -1 : 1
-    return a.displayName.localeCompare(b.displayName)
-  })
-
-  return candidates[0]
-}
-
-// Turns a Claude API response's content array into a list of steps —
-// each step is the text Claude said right before a tool call, paired
-// with that tool call. Used for both real backend responses and
-// EXAMPLE_RESPONSE above.
-function buildSteps(content) {
-  if (!Array.isArray(content)) return []
-
-  const steps = []
-  let pendingText = ''
-
-  for (const block of content) {
-    if (block.type === 'text') {
-      pendingText = block.text
-    } else if (block.type === 'tool_use') {
-      steps.push({ text: pendingText, toolCall: { name: block.name, input: block.input || {} } })
-      pendingText = ''
-    }
+  while (current && names.length < 10) {
+    if (current.name) names.push(current.name)
+    current = current.parent
   }
 
-  // No tool calls at all — Claude just replied with text, show it as one step.
-  if (steps.length === 0 && pendingText) steps.push({ text: pendingText, toolCall: null })
+  return names.join(' ').toLowerCase()
+}
 
-  return steps
+function classifyJointCategory(mesh) {
+  const name = (mesh.name || '').toLowerCase()
+  const context = getHierarchyText(mesh)
+
+  // Use the mesh's own name first. Parent names are only a fallback.
+  if (name.includes('capsule')) return 'Joint Capsule'
+  if (name.includes('ligament') || name.includes('ligamentum')) return 'Ligament'
+  if (name.includes('membrane')) return 'Membrane'
+  if (name.includes('retinaculum')) return 'Retinaculum'
+  if (name.includes('meniscus')) return 'Meniscus'
+  if (
+    name.includes('articular disc') ||
+    name.includes('intervertebral disc') ||
+    name.includes('nucleus pulposus') ||
+    /\bdisc\b/.test(name)
+  ) {
+    return 'Articular Disc'
+  }
+  if (name.includes('cartilage') || name.includes('labrum')) return 'Cartilage'
+  if (name.includes('tendon')) return 'Tendon'
+  if (name.includes('bursa')) return 'Bursa'
+
+  if (context.includes('capsule')) return 'Joint Capsule'
+  if (context.includes('ligament') || context.includes('ligamentum')) return 'Ligament'
+  if (context.includes('membrane')) return 'Membrane'
+  if (context.includes('meniscus')) return 'Meniscus'
+  if (context.includes('disc') || context.includes('nucleus pulposus')) return 'Articular Disc'
+  if (context.includes('cartilage') || context.includes('labrum')) return 'Cartilage'
+
+  if (
+    context.includes('joint') ||
+    context.includes('articulation') ||
+    context.includes('suture') ||
+    context.includes('syndesmosis') ||
+    context.includes('symphysis') ||
+    context.includes('synchondrosis') ||
+    context.includes('gomphosis') ||
+    context.includes('synostosis')
+  ) {
+    return 'Joint'
+  }
+
+  return 'Joint Structure'
+}
+
+function getGeometryStats(mesh) {
+  const geometry = mesh.geometry
+
+  if (!geometry) {
+    return { vertices: 0, triangles: 0, dimensions: [0, 0, 0] }
+  }
+
+  if (!geometry.boundingBox) geometry.computeBoundingBox()
+
+  const dimensions = geometry.boundingBox
+    ? geometry.boundingBox
+        .getSize(new THREE.Vector3())
+        .toArray()
+        .map((value) => Number(value.toFixed(4)))
+    : [0, 0, 0]
+
+  const vertices = geometry.attributes.position?.count ?? 0
+  const triangles = geometry.index
+    ? Math.floor(geometry.index.count / 3)
+    : Math.floor(vertices / 3)
+
+  return { vertices, triangles, dimensions }
+}
+
+function makeStructureRecord(mesh, config, fallbackIndex) {
+  const rawName = mesh.name?.trim() || `Unnamed ${config.defaultCategory || 'structure'} ${fallbackIndex}`
+  const displayName = formatStructureName(rawName)
+  const category = config.key === 'joints'
+    ? classifyJointCategory(mesh)
+    : config.defaultCategory
+
+  const groupKey = category === 'Muscle' ? classifyMuscleGroup(rawName) : null
+  const muscleGroup = groupKey ? MUSCLE_GROUPS[groupKey] : null
+  const groupLabel = muscleGroup?.label ?? null
+  const stats = getGeometryStats(mesh)
+
+  return {
+    id: `${config.key}:${mesh.uuid}`,
+    mesh,
+    name: rawName,
+    displayName,
+    displayLabel: `${displayName} — ${category}`,
+    searchName: `${displayName} ${category} ${config.label} ${groupLabel || ''}`.toLowerCase(),
+    category,
+    groupLabel,
+    sourceKey: config.key,
+    sourceLabel: config.sourceLabel,
+    info: category === 'Muscle' ? getMuscleInfo(rawName) : null,
+    ...stats,
+  }
 }
 
 function cloneAndNormalize(scene) {
@@ -181,83 +287,44 @@ function cloneAndNormalize(scene) {
   return model
 }
 
-function cloneMeshMaterials(mesh) {
-  const materials = getMaterials(mesh).map((material) => material.clone())
-  mesh.material = Array.isArray(mesh.material) ? materials : materials[0]
-}
-
-function makeMuscleRecord(mesh) {
-  const groupKey = classifyMuscleGroup(mesh.name)
-  const group = groupKey ? MUSCLE_GROUPS[groupKey] : null
-
-  if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox()
-
-  const dimensions = mesh.geometry.boundingBox
-    .getSize(new THREE.Vector3())
-    .toArray()
-    .map((value) => Number(value.toFixed(4)))
-
-  const vertices = mesh.geometry.attributes.position?.count ?? 0
-  const triangles = mesh.geometry.index
-    ? Math.floor(mesh.geometry.index.count / 3)
-    : Math.floor(vertices / 3)
-
-  return {
-    id: mesh.uuid,
-    mesh,
-    name: mesh.name,
-    displayName: formatMuscleName(mesh.name),
-    searchName: formatMuscleName(mesh.name).toLowerCase(),
-    groupLabel: group?.label ?? 'Other',
-    info: getMuscleInfo(mesh.name),
-    vertices,
-    triangles,
-    dimensions,
-  }
-}
-
-function prepareSkeleton(scene) {
+function prepareModel(scene, config) {
   const model = cloneAndNormalize(scene)
+  const structures = []
+  let fallbackIndex = 0
 
   model.traverse((child) => {
     if (!child.isMesh) return
 
-    cloneMeshMaterials(child)
-    child.raycast = NO_RAYCAST
-
-    getMaterials(child).forEach((material) => {
-      material.transparent = true
-    })
-  })
-
-  return model
-}
-
-function prepareAnatomy(scene) {
-  const model = cloneAndNormalize(scene)
-  const muscles = []
-
-  model.traverse((child) => {
-    if (!child.isMesh) return
-
+    fallbackIndex += 1
     cloneMeshMaterials(child)
     child.userData.originalRaycast = child.raycast
 
-    const groupKey = classifyMuscleGroup(child.name)
-    const groupColor = groupKey ? MUSCLE_GROUPS[groupKey]?.color : null
+    const rawName = child.name?.trim() || ''
+    const muscleGroupKey = config.key === 'muscles'
+      ? classifyMuscleGroup(rawName)
+      : null
+    const muscleGroupColor = muscleGroupKey
+      ? MUSCLE_GROUPS[muscleGroupKey]?.color
+      : null
 
     getMaterials(child).forEach((material) => {
       material.transparent = true
-      if (groupColor && material.color) material.color.set(groupColor)
-      if (material.color) material.userData.originalColor = material.color.clone()
+
+      if (muscleGroupColor && material.color) {
+        material.color.set(muscleGroupColor)
+      }
+
+      if (material.color) {
+        material.userData.originalColor = material.color.clone()
+      }
     })
 
-    const record = makeMuscleRecord(child)
-    child.userData.muscle = record
-    muscles.push(record)
+    const record = makeStructureRecord(child, config, fallbackIndex)
+    child.userData.structure = record
+    structures.push(record)
   })
 
-  model.userData.muscles = muscles
+  model.userData.structures = structures
   return model
 }
 
@@ -266,30 +333,71 @@ function setMeshVisible(mesh, visible) {
   mesh.raycast = visible ? mesh.userData.originalRaycast : NO_RAYCAST
 }
 
-function SkeletonModel({ opacity }) {
-  const { scene } = useGLTF('/skeleton.glb')
-  const model = useMemo(() => prepareSkeleton(scene), [scene])
+function resolveStructure(structureList, query, requiredCategory = null) {
+  if (!query) return null
 
-  useEffect(() => {
-    model.traverse((child) => {
-      if (!child.isMesh) return
+  const normalizedQuery = query.trim().toLowerCase()
+  if (!normalizedQuery) return null
 
-      getMaterials(child).forEach((material) => {
-        material.opacity = opacity
-        material.depthWrite = opacity > 0.95
-      })
-    })
-  }, [model, opacity])
+  const candidates = structureList.filter((structure) => {
+    if (requiredCategory && structure.category !== requiredCategory) return false
 
-  return <primitive object={model} />
+    return (
+      structure.searchName.includes(normalizedQuery) ||
+      structure.name.toLowerCase().includes(normalizedQuery) ||
+      structure.displayLabel.toLowerCase().includes(normalizedQuery)
+    )
+  })
+
+  if (!candidates.length) return null
+
+  candidates.sort((a, b) => {
+    const aExact = a.displayName.toLowerCase() === normalizedQuery || a.name.toLowerCase() === normalizedQuery
+    const bExact = b.displayName.toLowerCase() === normalizedQuery || b.name.toLowerCase() === normalizedQuery
+    if (aExact !== bExact) return aExact ? -1 : 1
+
+    const aStarts = a.searchName.startsWith(normalizedQuery)
+    const bStarts = b.searchName.startsWith(normalizedQuery)
+    if (aStarts !== bStarts) return aStarts ? -1 : 1
+
+    return a.displayLabel.localeCompare(b.displayLabel)
+  })
+
+  return candidates[0]
 }
 
-function AnatomyModel({
+function buildSteps(content) {
+  if (!Array.isArray(content)) return []
+
+  const steps = []
+  let pendingText = ''
+
+  for (const block of content) {
+    if (block.type === 'text') {
+      pendingText = block.text
+    } else if (block.type === 'tool_use') {
+      steps.push({
+        text: pendingText,
+        toolCall: { name: block.name, input: block.input || {} },
+      })
+      pendingText = ''
+    }
+  }
+
+  if (steps.length === 0 && pendingText) {
+    steps.push({ text: pendingText, toolCall: null })
+  }
+
+  return steps
+}
+
+function StructureModel({
+  config,
   opacity,
-  selectedMuscle,
+  selectedStructure,
   hoveredId,
   hiddenIds,
-  muscleColors,
+  structureColors,
   selectedIds,
   showOnlySelected,
   highlightSelected,
@@ -297,37 +405,48 @@ function AnatomyModel({
   onSelect,
   onHover,
 }) {
-  const { scene } = useGLTF('/anatomy.glb')
-  const model = useMemo(() => prepareAnatomy(scene), [scene])
+  const { scene } = useGLTF(config.url)
+  const model = useMemo(() => prepareModel(scene, config), [scene, config])
 
   useEffect(() => {
-    onReady(model.userData.muscles)
-  }, [model, onReady])
+    onReady(config.key, model.userData.structures)
+  }, [config.key, model, onReady])
 
   useEffect(() => {
     model.traverse((child) => {
       if (!child.isMesh) return
 
-      const muscle = child.userData.muscle
-      const id = muscle.id
-      const visible = !hiddenIds.has(id) && (!showOnlySelected || selectedIds.has(id))
-      setMeshVisible(child, visible)
+      const structure = child.userData.structure
+      if (!structure) return
 
+      const id = structure.id
+      const visible = (
+        opacity > 0 &&
+        !hiddenIds.has(id) &&
+        (!showOnlySelected || selectedIds.has(id))
+      )
+
+      setMeshVisible(child, visible)
       if (!visible) return
 
       getMaterials(child).forEach((material) => {
-        if (!material.color) return
+        if (material.color) {
+          const selectedColor = structureColors[id]
 
-        const selectedColor = muscleColors[id]
-        if (selectedColor && selectedColor !== 'original') {
-          material.color.set(selectedColor)
-        } else {
-          material.color.copy(material.userData.originalColor)
-        }
+          if (selectedColor && selectedColor !== 'original') {
+            material.color.set(selectedColor)
+          } else if (material.userData.originalColor) {
+            material.color.copy(material.userData.originalColor)
+          }
 
-        if (id === hoveredId) material.color.lerp(WHITE, 0.58)
-        else if (highlightSelected && (id === selectedMuscle?.id || selectedIds.has(id))) {
-          material.color.lerp(WHITE, 0.3)
+          if (id === hoveredId) {
+            material.color.lerp(WHITE, 0.58)
+          } else if (
+            highlightSelected &&
+            (id === selectedStructure?.id || selectedIds.has(id))
+          ) {
+            material.color.lerp(WHITE, 0.3)
+          }
         }
 
         material.opacity = opacity
@@ -337,31 +456,33 @@ function AnatomyModel({
   }, [
     model,
     opacity,
-    selectedMuscle,
+    selectedStructure,
     hoveredId,
     hiddenIds,
-    muscleColors,
+    structureColors,
     selectedIds,
     showOnlySelected,
     highlightSelected,
   ])
 
-  const muscleFromEvent = (event) => event.object?.userData?.muscle ?? null
+  const structureFromEvent = (event) => event.object?.userData?.structure ?? null
 
   return (
     <primitive
       object={model}
       onClick={(event) => {
-        const muscle = muscleFromEvent(event)
-        if (!muscle || event.delta > 4) return
+        const structure = structureFromEvent(event)
+        if (!structure || event.delta > 4) return
+
         event.stopPropagation()
-        onSelect(muscle)
+        onSelect(structure)
       }}
       onPointerMove={(event) => {
-        const muscle = muscleFromEvent(event)
-        if (!muscle) return
+        const structure = structureFromEvent(event)
+        if (!structure) return
+
         event.stopPropagation()
-        onHover(muscle.id)
+        onHover(structure.id)
       }}
       onPointerOut={() => onHover(null)}
     />
@@ -371,15 +492,16 @@ function AnatomyModel({
 function CameraFocus({ request, controlsRef }) {
   const { camera } = useThree()
   const handledToken = useRef(0)
-  const anim = useRef(null) // { fromPosition, toPosition, fromTarget, toTarget, elapsed }
-  const ZOOM_DURATION = 0.6 // seconds
+  const animation = useRef(null)
+  const zoomDuration = 0.6
 
   useFrame((_, delta) => {
     const controls = controlsRef.current
     if (!controls) return
 
     if (request && handledToken.current !== request.token) {
-      const mesh = request.muscle?.mesh
+      const mesh = request.structure?.mesh
+      let requestHandled = false
 
       if (mesh && mesh.visible) {
         mesh.updateWorldMatrix(true, false)
@@ -387,59 +509,66 @@ function CameraFocus({ request, controlsRef }) {
 
         if (!box.isEmpty()) {
           const center = box.getCenter(new THREE.Vector3())
-          const radius = Math.max(box.getBoundingSphere(new THREE.Sphere()).radius, 0.03)
+          const radius = Math.max(
+            box.getBoundingSphere(new THREE.Sphere()).radius,
+            0.03,
+          )
+
           const direction = camera.position.clone().sub(controls.target)
           direction.y = 0
-
           if (direction.lengthSq() < 0.0001) direction.set(0, 0, 1)
           direction.normalize()
 
           const verticalFov = THREE.MathUtils.degToRad(camera.fov)
           const horizontalFov = 2 * Math.atan(Math.tan(verticalFov / 2) * camera.aspect)
           const limitingFov = Math.min(verticalFov, horizontalFov)
-          const distance = Math.max(radius / Math.sin(limitingFov / 2) * 1.35, 0.18)
+          const distance = Math.max(
+            (radius / Math.sin(limitingFov / 2)) * 1.35,
+            0.18,
+          )
 
           const toPosition = center.clone().add(direction.multiplyScalar(distance))
           toPosition.y = center.y
 
-          // Near/far can jump immediately — only position and target are animated.
           camera.near = Math.max(distance / 100, 0.001)
           camera.far = Math.max(distance * 100, 100)
           camera.updateProjectionMatrix()
 
-          anim.current = {
+          animation.current = {
             fromPosition: camera.position.clone(),
             toPosition,
             fromTarget: controls.target.clone(),
             toTarget: center.clone(),
             elapsed: 0,
           }
+          requestHandled = true
         }
       }
 
-      handledToken.current = request.token
+      // A hidden structure may become visible after React applies an unhide
+      // or show-only-selected update. Retry on the next frame until it is ready.
+      if (requestHandled) handledToken.current = request.token
     }
 
-    if (anim.current) {
-      const current = anim.current
-      current.elapsed += delta
-      const t = Math.min(current.elapsed / ZOOM_DURATION, 1)
-      const eased = t * t * (3 - 2 * t) // smoothstep, so the zoom eases in/out instead of moving at constant speed
+    if (!animation.current) return
 
-      camera.position.lerpVectors(current.fromPosition, current.toPosition, eased)
-      controls.target.lerpVectors(current.fromTarget, current.toTarget, eased)
-      camera.lookAt(controls.target)
-      controls.update()
+    const current = animation.current
+    current.elapsed += delta
 
-      if (t >= 1) anim.current = null
-    }
+    const progress = Math.min(current.elapsed / zoomDuration, 1)
+    const eased = progress * progress * (3 - 2 * progress)
+
+    camera.position.lerpVectors(current.fromPosition, current.toPosition, eased)
+    controls.target.lerpVectors(current.fromTarget, current.toTarget, eased)
+    camera.lookAt(controls.target)
+    controls.update()
+
+    if (progress >= 1) animation.current = null
   })
 
   return null
 }
 
-// Exposes the r3f camera to code outside the Canvas (drag-select needs it
-// to project muscle positions to screen space).
 function CameraRefSync({ cameraRef }) {
   const { camera } = useThree()
 
@@ -453,7 +582,7 @@ function CameraRefSync({ cameraRef }) {
 function RangeControl({ label, value, onChange }) {
   return (
     <div style={{ marginBottom: 12 }}>
-      <label>{label}: {value.toFixed(2)}</label>
+      <label>{label} opacity: {value.toFixed(2)}</label>
       <input
         type="range"
         min="0"
@@ -484,29 +613,31 @@ function SearchBox({ value, results, onChange, onChoose }) {
       <input
         value={value}
         onChange={(event) => onChange(event.target.value)}
-        placeholder="Search a muscle..."
+        placeholder="Search bones, muscles, joints, ligaments..."
         style={styles.input}
       />
 
       {value.trim() && (
-        <div style={{
-          position: 'absolute',
-          top: 'calc(100% + 5px)',
-          left: 0,
-          right: 0,
-          zIndex: 20,
-          maxHeight: 230,
-          overflowY: 'auto',
-          border: '1px solid rgba(255, 255, 255, 0.16)',
-          borderRadius: 8,
-          background: '#1f2937',
-          boxShadow: '0 12px 28px rgba(0, 0, 0, 0.4)',
-        }}>
-          {results.length ? results.map((muscle) => (
+        <div
+          style={{
+            position: 'absolute',
+            top: 'calc(100% + 5px)',
+            left: 0,
+            right: 0,
+            zIndex: 20,
+            maxHeight: 230,
+            overflowY: 'auto',
+            border: '1px solid rgba(255, 255, 255, 0.16)',
+            borderRadius: 8,
+            background: '#1f2937',
+            boxShadow: '0 12px 28px rgba(0, 0, 0, 0.4)',
+          }}
+        >
+          {results.length ? results.map((structure) => (
             <button
-              key={muscle.id}
+              key={structure.id}
               type="button"
-              onClick={() => onChoose(muscle)}
+              onClick={() => onChoose(structure)}
               style={{
                 display: 'block',
                 width: '100%',
@@ -519,11 +650,15 @@ function SearchBox({ value, results, onChange, onChoose }) {
                 cursor: 'pointer',
               }}
             >
-              <div>{muscle.displayName}</div>
-              <div style={{ ...styles.muted, fontSize: 11 }}>{muscle.groupLabel}</div>
+              <div>{structure.displayLabel}</div>
+              <div style={{ ...styles.muted, fontSize: 11 }}>
+                {structure.groupLabel || structure.sourceLabel}
+              </div>
             </button>
           )) : (
-            <div style={{ padding: 10, ...styles.muted }}>No matching muscle</div>
+            <div style={{ padding: 10, ...styles.muted }}>
+              No matching structure
+            </div>
           )}
         </div>
       )}
@@ -531,10 +666,27 @@ function SearchBox({ value, results, onChange, onChoose }) {
   )
 }
 
-function AICommandBar({ value, status, message, hasNextStep, onChange, onSubmit, onTryExample, onNextStep, onDone }) {
+function AICommandBar({
+  value,
+  status,
+  message,
+  hasNextStep,
+  onChange,
+  onSubmit,
+  onTryExample,
+  onNextStep,
+  onDone,
+}) {
   return (
     <div style={{ ...styles.card, marginBottom: 14 }}>
-      <div style={{ ...styles.muted, fontSize: 11, textTransform: 'uppercase', marginBottom: 7 }}>
+      <div
+        style={{
+          ...styles.muted,
+          fontSize: 11,
+          textTransform: 'uppercase',
+          marginBottom: 7,
+        }}
+      >
         Ask the AI
       </div>
 
@@ -580,6 +732,7 @@ function AICommandBar({ value, status, message, hasNextStep, onChange, onSubmit,
           }}
         >
           <span>{message}</span>
+
           {hasNextStep ? (
             <button
               type="button"
@@ -604,8 +757,8 @@ function AICommandBar({ value, status, message, hasNextStep, onChange, onSubmit,
   )
 }
 
-function MuscleDetails({
-  muscle,
+function StructureDetails({
+  structure,
   isHidden,
   isSelected,
   selectedColor,
@@ -615,29 +768,53 @@ function MuscleDetails({
   onFocus,
   onDeselect,
 }) {
-  if (!muscle) {
+  if (!structure) {
     return (
-      <div style={{ paddingTop: 12, borderTop: '1px solid rgba(255, 255, 255, 0.15)', ...styles.muted }}>
-        Click a muscle or choose one from search to view its properties.
+      <div
+        style={{
+          paddingTop: 12,
+          borderTop: '1px solid rgba(255, 255, 255, 0.15)',
+          ...styles.muted,
+        }}
+      >
+        Click a structure or choose one from search to view its properties.
       </div>
     )
   }
 
   return (
-    <section style={{ paddingTop: 14, borderTop: '1px solid rgba(255, 255, 255, 0.15)' }}>
-      <div style={{ fontSize: 17, fontWeight: 700 }}>{muscle.displayName}</div>
-      <div style={{ ...styles.muted, margin: '3px 0 12px' }}>{muscle.groupLabel}</div>
+    <section
+      style={{
+        paddingTop: 14,
+        borderTop: '1px solid rgba(255, 255, 255, 0.15)',
+      }}
+    >
+      <div style={{ fontSize: 17, fontWeight: 700 }}>{structure.displayName}</div>
+      <div style={{ ...styles.muted, margin: '3px 0 12px' }}>
+        {structure.category}
+        {structure.groupLabel ? ` · ${structure.groupLabel}` : ''}
+      </div>
 
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 12 }}>
+      <div
+        style={{
+          display: 'grid',
+          gridTemplateColumns: '1fr 1fr',
+          gap: 8,
+          marginBottom: 12,
+        }}
+      >
         <button type="button" onClick={onToggleHidden} style={styles.button}>
-          {isHidden ? 'Show muscle' : 'Hide muscle'}
+          {isHidden ? 'Show structure' : 'Hide structure'}
         </button>
+
         <button
           type="button"
           onClick={onToggleSelected}
           style={{
             ...styles.button,
-            background: isSelected ? 'rgba(37, 99, 235, 0.45)' : styles.button.background,
+            background: isSelected
+              ? 'rgba(37, 99, 235, 0.45)'
+              : styles.button.background,
           }}
         >
           {isSelected ? 'Remove from selected list' : 'Add to selected list'}
@@ -645,12 +822,21 @@ function MuscleDetails({
       </div>
 
       <div style={{ marginBottom: 14 }}>
-        <div style={{ ...styles.muted, fontSize: 11, textTransform: 'uppercase', marginBottom: 7 }}>
+        <div
+          style={{
+            ...styles.muted,
+            fontSize: 11,
+            textTransform: 'uppercase',
+            marginBottom: 7,
+          }}
+        >
           Color
         </div>
+
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 7 }}>
           {COLOR_OPTIONS.map(([label, value]) => {
             const active = selectedColor === value
+
             return (
               <button
                 key={value}
@@ -662,10 +848,14 @@ function MuscleDetails({
                   width: value === 'original' ? 58 : 25,
                   height: 25,
                   padding: 0,
-                  border: active ? '2px solid white' : '1px solid rgba(255, 255, 255, 0.35)',
+                  border: active
+                    ? '2px solid white'
+                    : '1px solid rgba(255, 255, 255, 0.35)',
                   borderRadius: 6,
                   color: 'white',
-                  background: value === 'original' ? 'rgba(255, 255, 255, 0.1)' : value,
+                  background: value === 'original'
+                    ? 'rgba(255, 255, 255, 0.1)'
+                    : value,
                   cursor: 'pointer',
                   fontSize: 10,
                 }}
@@ -677,17 +867,38 @@ function MuscleDetails({
         </div>
       </div>
 
-      <StatRow label="Origin">{muscle.info.origin}</StatRow>
-      <StatRow label="Insertion">{muscle.info.insertion}</StatRow>
-      <StatRow label="Action">{muscle.info.action}</StatRow>
-      <StatRow label="Innervation">{muscle.info.innervation}</StatRow>
-      {muscle.info.notes && <StatRow label="Notes">{muscle.info.notes}</StatRow>}
+      <StatRow label="Category">{structure.category}</StatRow>
+      <StatRow label="Source model">{structure.sourceLabel}</StatRow>
+      <StatRow label="Original object name">{structure.name}</StatRow>
 
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, paddingTop: 10, borderTop: '1px solid rgba(255, 255, 255, 0.12)' }}>
-        <StatRow label="Vertices">{muscle.vertices.toLocaleString()}</StatRow>
-        <StatRow label="Triangles">{muscle.triangles.toLocaleString()}</StatRow>
+      {structure.category === 'Muscle' && structure.info && (
+        <>
+          <StatRow label="Origin">{structure.info.origin}</StatRow>
+          <StatRow label="Insertion">{structure.info.insertion}</StatRow>
+          <StatRow label="Action">{structure.info.action}</StatRow>
+          <StatRow label="Innervation">{structure.info.innervation}</StatRow>
+          {structure.info.notes && (
+            <StatRow label="Notes">{structure.info.notes}</StatRow>
+          )}
+        </>
+      )}
+
+      <div
+        style={{
+          display: 'grid',
+          gridTemplateColumns: '1fr 1fr',
+          gap: 8,
+          paddingTop: 10,
+          borderTop: '1px solid rgba(255, 255, 255, 0.12)',
+        }}
+      >
+        <StatRow label="Vertices">{structure.vertices.toLocaleString()}</StatRow>
+        <StatRow label="Triangles">{structure.triangles.toLocaleString()}</StatRow>
       </div>
-      <StatRow label="Mesh dimensions">{muscle.dimensions.join(' × ')}</StatRow>
+
+      <StatRow label="Mesh dimensions">
+        {structure.dimensions.join(' × ')}
+      </StatRow>
 
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
         <button type="button" onClick={onFocus} style={styles.button}>
@@ -702,32 +913,37 @@ function MuscleDetails({
   )
 }
 
-// One expandable tab per muscle in the "selected" list. Expanding a tab
-// reuses MuscleDetails itself, bound to that muscle instead of the single
-// selectedMuscle used elsewhere.
-function SelectedMusclesPanel({
-  selectedMuscles,
+function SelectedStructuresPanel({
+  selectedStructures,
   expandedId,
   hiddenIds,
-  muscleColors,
+  structureColors,
   onToggleExpand,
   onToggleHidden,
   onColorChange,
   onFocus,
   onRemove,
 }) {
-  if (selectedMuscles.length === 0) {
-    return <div style={{ ...styles.muted, fontSize: 12 }}>No muscles selected yet.</div>
+  if (selectedStructures.length === 0) {
+    return (
+      <div style={{ ...styles.muted, fontSize: 12 }}>
+        No structures selected yet.
+      </div>
+    )
   }
 
   return (
     <div>
-      {selectedMuscles.map((muscle) => {
-        const expanded = expandedId === muscle.id
+      {selectedStructures.map((structure) => {
+        const expanded = expandedId === structure.id
+
         return (
-          <div key={muscle.id} style={{ borderTop: '1px solid rgba(255, 255, 255, 0.12)' }}>
+          <div
+            key={structure.id}
+            style={{ borderTop: '1px solid rgba(255, 255, 255, 0.12)' }}
+          >
             <div
-              onClick={() => onToggleExpand(muscle.id)}
+              onClick={() => onToggleExpand(structure.id)}
               style={{
                 display: 'flex',
                 alignItems: 'center',
@@ -736,21 +952,23 @@ function SelectedMusclesPanel({
                 cursor: 'pointer',
               }}
             >
-              <span>{muscle.displayName}</span>
-              <span style={{ ...styles.muted, fontSize: 14 }}>{expanded ? '▾' : '▸'}</span>
+              <span>{structure.displayLabel}</span>
+              <span style={{ ...styles.muted, fontSize: 14 }}>
+                {expanded ? '▾' : '▸'}
+              </span>
             </div>
 
             {expanded && (
-              <MuscleDetails
-                muscle={muscle}
-                isHidden={hiddenIds.has(muscle.id)}
+              <StructureDetails
+                structure={structure}
+                isHidden={hiddenIds.has(structure.id)}
                 isSelected
-                selectedColor={muscleColors[muscle.id] ?? 'original'}
-                onToggleHidden={() => onToggleHidden(muscle)}
-                onToggleSelected={() => onRemove(muscle)}
-                onColorChange={(color) => onColorChange(muscle, color)}
-                onFocus={() => onFocus(muscle)}
-                onDeselect={() => onRemove(muscle)}
+                selectedColor={structureColors[structure.id] ?? 'original'}
+                onToggleHidden={() => onToggleHidden(structure)}
+                onToggleSelected={() => onRemove(structure)}
+                onColorChange={(color) => onColorChange(structure, color)}
+                onFocus={() => onFocus(structure)}
+                onDeselect={() => onRemove(structure)}
               />
             )}
           </div>
@@ -761,126 +979,135 @@ function SelectedMusclesPanel({
 }
 
 function App() {
-  const [skeletonOpacity, setSkeletonOpacity] = useState(1)
-  const [anatomyOpacity, setAnatomyOpacity] = useState(0.75)
-  const [muscles, setMuscles] = useState([])
-  const [selectedMuscle, setSelectedMuscle] = useState(null)
+  const [modelOpacities, setModelOpacities] = useState(() => Object.fromEntries(
+    MODEL_CONFIGS.map((config) => [config.key, config.initialOpacity]),
+  ))
+  const [structuresByModel, setStructuresByModel] = useState({})
+  const [selectedStructure, setSelectedStructure] = useState(null)
   const [hoveredId, setHoveredId] = useState(null)
   const [hiddenIds, setHiddenIds] = useState(() => new Set())
-  const [muscleColors, setMuscleColors] = useState({})
+  const [structureColors, setStructureColors] = useState({})
   const [searchText, setSearchText] = useState('')
   const [focusRequest, setFocusRequest] = useState(null)
+
   const [commandText, setCommandText] = useState('')
-  const [commandStatus, setCommandStatus] = useState(null) // null | 'loading' | 'error'
+  const [commandStatus, setCommandStatus] = useState(null)
   const [commandMessage, setCommandMessage] = useState('')
   const [commandSteps, setCommandSteps] = useState([])
   const [stepIndex, setStepIndex] = useState(0)
 
-  // "Selected muscles" list — separate from selectedMuscle (the single
-  // muscle shown in the main details panel).
   const [selectedIds, setSelectedIds] = useState(() => new Set())
   const [expandedSelectedId, setExpandedSelectedId] = useState(null)
   const [multiSelectMode, setMultiSelectMode] = useState(false)
   const [dragSelectMode, setDragSelectMode] = useState(false)
   const [showOnlySelected, setShowOnlySelected] = useState(false)
   const [highlightSelected, setHighlightSelected] = useState(true)
-  const [dragBox, setDragBox] = useState(null) // {x0,y0,x1,y1} in overlay-local px, while dragging
+  const [dragBox, setDragBox] = useState(null)
 
   const controlsRef = useRef()
   const focusToken = useRef(0)
   const cameraRef = useRef()
   const overlayRef = useRef()
 
+  const handleModelReady = useCallback((modelKey, modelStructures) => {
+    setStructuresByModel((current) => {
+      if (current[modelKey] === modelStructures) return current
+      return { ...current, [modelKey]: modelStructures }
+    })
+  }, [])
+
+  const structures = useMemo(
+    () => MODEL_CONFIGS.flatMap((config) => structuresByModel[config.key] || []),
+    [structuresByModel],
+  )
+
+  const muscles = useMemo(
+    () => structures.filter((structure) => structure.category === 'Muscle'),
+    [structures],
+  )
+
+  const selectedStructures = useMemo(
+    () => structures.filter((structure) => selectedIds.has(structure.id)),
+    [structures, selectedIds],
+  )
+
   const searchResults = useMemo(() => {
     const query = searchText.trim().toLowerCase()
     if (!query) return []
 
-    return muscles
-      .filter((muscle) => muscle.searchName.includes(query) || muscle.name.toLowerCase().includes(query))
+    return structures
+      .filter((structure) => (
+        structure.searchName.includes(query) ||
+        structure.name.toLowerCase().includes(query) ||
+        structure.displayLabel.toLowerCase().includes(query)
+      ))
       .sort((a, b) => {
         const aStarts = a.searchName.startsWith(query)
         const bStarts = b.searchName.startsWith(query)
         if (aStarts !== bStarts) return aStarts ? -1 : 1
-        return a.displayName.localeCompare(b.displayName)
+        return a.displayLabel.localeCompare(b.displayLabel)
       })
       .slice(0, 12)
-  }, [muscles, searchText])
+  }, [structures, searchText])
 
-  const requestFocus = (muscle) => {
+  const setModelOpacity = (modelKey, opacity) => {
+    setModelOpacities((current) => ({ ...current, [modelKey]: opacity }))
+  }
+
+  const requestFocus = (structure) => {
     focusToken.current += 1
-    setFocusRequest({ muscle, token: focusToken.current })
+    setFocusRequest({ structure, token: focusToken.current })
   }
 
-  const selectMuscle = (muscle, focus = false) => {
-    setSelectedMuscle(muscle)
-    if (focus) requestFocus(muscle)
+  const selectStructure = (structure) => {
+    setSelectedStructure(structure)
   }
 
-  const chooseSearchResult = (muscle) => {
-    const id = muscle.id
+  const focusStructure = (structure) => {
+    if (!structure) return
+
     setHiddenIds((current) => {
       const next = new Set(current)
-      next.delete(id)
+      next.delete(structure.id)
       return next
     })
 
     if (showOnlySelected) {
-      setSelectedIds((current) => new Set(current).add(id))
+      setSelectedIds((current) => new Set(current).add(structure.id))
     }
 
-    setSearchText('')
-    selectMuscle(muscle, true)
+    setSelectedStructure(structure)
+    requestFocus(structure)
   }
 
-  // Generic per-muscle actions, usable for any muscle — not just the one
-  // currently shown in the main details panel. Shared by that panel and
-  // by each expandable card in the "selected" list below.
-  const toggleMuscleHidden = (muscle) => {
+  const chooseSearchResult = (structure) => {
+    setSearchText('')
+    focusStructure(structure)
+  }
+
+  const toggleStructureHidden = (structure) => {
     setHiddenIds((current) => {
       const next = new Set(current)
-      next.has(muscle.id) ? next.delete(muscle.id) : next.add(muscle.id)
+      next.has(structure.id)
+        ? next.delete(structure.id)
+        : next.add(structure.id)
       return next
     })
   }
 
-  const setMuscleColor = (muscle, color) => {
-    setMuscleColors((current) => ({ ...current, [muscle.id]: color }))
+  const setStructureColor = (structure, color) => {
+    setStructureColors((current) => ({
+      ...current,
+      [structure.id]: color,
+    }))
   }
 
   const toggleSelectedHidden = () => {
-    if (!selectedMuscle) return
-    toggleMuscleHidden(selectedMuscle)
+    if (!selectedStructure) return
+    toggleStructureHidden(selectedStructure)
     setHoveredId(null)
   }
 
-  const toggleSelectedInList = () => {
-    if (!selectedMuscle) return
-    toggleSelectedId(selectedMuscle.id)
-  }
-
-  const changeSelectedColor = (color) => {
-    if (!selectedMuscle) return
-    setMuscleColor(selectedMuscle, color)
-  }
-
-  const focusSelectedMuscle = () => {
-    if (!selectedMuscle) return
-
-    setHiddenIds((current) => {
-      const next = new Set(current)
-      next.delete(selectedMuscle.id)
-      return next
-    })
-
-    if (showOnlySelected) {
-      setSelectedIds((current) => new Set(current).add(selectedMuscle.id))
-    }
-
-    requestFocus(selectedMuscle)
-  }
-
-  // The "selected" list — a separate group of muscles a user builds up via
-  // multi-select clicking or drag-select, independent of selectedMuscle.
   const toggleSelectedId = (id) => {
     setSelectedIds((current) => {
       const next = new Set(current)
@@ -897,32 +1124,57 @@ function App() {
     })
   }
 
-  // What a muscle click does depends on whether multi-select mode is on.
-  const handleMuscleClick = (muscle) => {
-    if (multiSelectMode) toggleSelectedId(muscle.id)
-    else selectMuscle(muscle, false)
+  const toggleSelectedInList = () => {
+    if (!selectedStructure) return
+    toggleSelectedId(selectedStructure.id)
   }
 
-  // Drag-select: while active, an overlay over the canvas (see render below)
-  // captures the drag instead of OrbitControls, and on release we project
-  // each visible muscle's world position to screen space to see which ones
-  // fall inside the drawn rectangle.
+  const changeSelectedColor = (color) => {
+    if (!selectedStructure) return
+    setStructureColor(selectedStructure, color)
+  }
+
+  const focusSelectedStructure = () => {
+    focusStructure(selectedStructure)
+  }
+
+  const handleStructureClick = (structure) => {
+    if (multiSelectMode) {
+      toggleSelectedId(structure.id)
+    } else {
+      selectStructure(structure)
+    }
+  }
+
   const dragBoxPoint = (event) => {
-    const rect = overlayRef.current.getBoundingClientRect()
-    return { x: event.clientX - rect.left, y: event.clientY - rect.top }
+    const rect = overlayRef.current?.getBoundingClientRect()
+    if (!rect) return null
+
+    return {
+      x: event.clientX - rect.left,
+      y: event.clientY - rect.top,
+    }
   }
 
   const startDragBox = (event) => {
     if (!dragSelectMode) return
-    event.currentTarget.setPointerCapture(event.pointerId)
+
     const point = dragBoxPoint(event)
+    if (!point) return
+
+    event.currentTarget.setPointerCapture(event.pointerId)
     setDragBox({ x0: point.x, y0: point.y, x1: point.x, y1: point.y })
   }
 
   const updateDragBox = (event) => {
     if (!dragBox) return
+
     const point = dragBoxPoint(event)
-    setDragBox((current) => ({ ...current, x1: point.x, y1: point.y }))
+    if (!point) return
+
+    setDragBox((current) => (
+      current ? { ...current, x1: point.x, y1: point.y } : current
+    ))
   }
 
   const finishDragBox = () => {
@@ -936,10 +1188,10 @@ function App() {
       const right = Math.max(dragBox.x0, dragBox.x1)
       const top = Math.min(dragBox.y0, dragBox.y1)
       const bottom = Math.max(dragBox.y0, dragBox.y1)
-
       const matches = []
-      muscles.forEach((muscle) => {
-        const mesh = muscle.mesh
+
+      structures.forEach((structure) => {
+        const mesh = structure.mesh
         if (!mesh || !mesh.visible) return
 
         mesh.updateWorldMatrix(true, false)
@@ -950,7 +1202,9 @@ function App() {
         const x = (center.x * 0.5 + 0.5) * rect.width
         const y = (-center.y * 0.5 + 0.5) * rect.height
 
-        if (x >= left && x <= right && y >= top && y <= bottom) matches.push(muscle.id)
+        if (x >= left && x <= right && y >= top && y <= bottom) {
+          matches.push(structure.id)
+        }
       })
 
       if (matches.length) {
@@ -965,61 +1219,112 @@ function App() {
     setDragBox(null)
   }
 
-  // Runs one Claude tool_use call using the same state setters the UI
-  // buttons already use above. Returns an error string, or null on success.
   const runToolCall = ({ name, input }) => {
-    const withMuscle = (fn) => {
-      const muscle = resolveMuscle(muscles, input.muscle)
-      if (!muscle) return `Couldn't find "${input.muscle}".`
-      fn(muscle)
+    const structureQuery = input.structure ?? input.muscle
+
+    const withStructure = (fn, requiredCategory = null) => {
+      if (!structureQuery) return 'Missing structure name.'
+
+      const structure = resolveStructure(structures, structureQuery, requiredCategory)
+      if (!structure) return `Couldn't find "${structureQuery}".`
+
+      fn(structure)
       return null
     }
 
+    const showStructure = (structure) => {
+      setHiddenIds((current) => {
+        const next = new Set(current)
+        next.delete(structure.id)
+        return next
+      })
+    }
+
+    const hideStructure = (structure) => {
+      setHiddenIds((current) => new Set(current).add(structure.id))
+    }
+
     switch (name) {
+      // Existing muscle tool names are preserved for the current backend.
       case 'select_muscle':
-        return withMuscle((muscle) => selectMuscle(muscle, false))
+        return withStructure((structure) => selectStructure(structure), 'Muscle')
       case 'focus_muscle':
-        return withMuscle((muscle) => selectMuscle(muscle, true))
+        return withStructure((structure) => focusStructure(structure), 'Muscle')
       case 'hide_muscle':
-        return withMuscle((muscle) => setHiddenIds((current) => new Set(current).add(muscle.id)))
+        return withStructure(hideStructure, 'Muscle')
       case 'show_muscle':
-        return withMuscle((muscle) =>
-          setHiddenIds((current) => {
-            const next = new Set(current)
-            next.delete(muscle.id)
-            return next
-          })
-        )
-      // These keep their original tool names for the AI, but now operate on
-      // the selected list / "show only selected" — isolate mode was removed
-      // in favor of that.
-      case 'add_to_isolated':
-        return withMuscle((muscle) => setSelectedIds((current) => new Set(current).add(muscle.id)))
-      case 'remove_from_isolated':
-        return withMuscle((muscle) =>
-          setSelectedIds((current) => {
-            const next = new Set(current)
-            next.delete(muscle.id)
-            return next
-          })
-        )
+        return withStructure(showStructure, 'Muscle')
       case 'set_muscle_color':
-        return withMuscle((muscle) =>
-          setMuscleColors((current) => ({ ...current, [muscle.id]: input.color || 'original' }))
+        return withStructure(
+          (structure) => setStructureColor(structure, input.color || 'original'),
+          'Muscle',
         )
       case 'reset_muscle_color':
-        return withMuscle((muscle) => setMuscleColors((current) => ({ ...current, [muscle.id]: 'original' })))
+        return withStructure(
+          (structure) => setStructureColor(structure, 'original'),
+          'Muscle',
+        )
+
+      // Generic aliases let the frontend support an anatomy-wide backend later.
+      case 'select_structure':
+        return withStructure((structure) => selectStructure(structure))
+      case 'focus_structure':
+        return withStructure((structure) => focusStructure(structure))
+      case 'hide_structure':
+        return withStructure(hideStructure)
+      case 'show_structure':
+        return withStructure(showStructure)
+      case 'set_structure_color':
+        return withStructure(
+          (structure) => setStructureColor(structure, input.color || 'original'),
+        )
+      case 'reset_structure_color':
+        return withStructure(
+          (structure) => setStructureColor(structure, 'original'),
+        )
+
+      case 'add_to_isolated':
+      case 'add_to_selected':
+        return withStructure(
+          (structure) => setSelectedIds((current) => new Set(current).add(structure.id)),
+          input.structure ? null : 'Muscle',
+        )
+      case 'remove_from_isolated':
+      case 'remove_from_selected':
+        return withStructure(
+          (structure) => {
+            setSelectedIds((current) => {
+              const next = new Set(current)
+              next.delete(structure.id)
+              return next
+            })
+          },
+          input.structure ? null : 'Muscle',
+        )
       case 'set_isolate_mode':
         setShowOnlySelected(Boolean(input.enabled))
         return null
       case 'clear_isolated_list':
+      case 'clear_selected_list':
         setSelectedIds(new Set())
         return null
       case 'show_all_muscles':
+        setHiddenIds((current) => {
+          const muscleIds = new Set(muscles.map((muscle) => muscle.id))
+          return new Set([...current].filter((id) => !muscleIds.has(id)))
+        })
+        return null
+      case 'show_all_structures':
         setHiddenIds(new Set())
         return null
       case 'deselect_muscle':
-        setSelectedMuscle(null)
+        if (selectedStructure?.category === 'Muscle') {
+          setSelectedStructure(null)
+          setHoveredId(null)
+        }
+        return null
+      case 'deselect_structure':
+        setSelectedStructure(null)
         setHoveredId(null)
         return null
       default:
@@ -1027,30 +1332,28 @@ function App() {
     }
   }
 
-  // Runs one step's tool call (if it has one) and shows its text.
   const runStep = (step) => {
     const error = step.toolCall ? runToolCall(step.toolCall) : null
     setCommandMessage(error || step.text || 'Done.')
     setCommandStatus(error ? 'error' : null)
   }
 
-  // Starts a new list of steps from a Claude response's content array,
-  // running only the first one — the rest wait for the "next" arrow.
   const beginSteps = (content) => {
     const steps = buildSteps(content)
     setCommandSteps(steps)
     setStepIndex(0)
+
     if (steps.length > 0) runStep(steps[0])
   }
 
   const goToNextStep = () => {
-    const next = stepIndex + 1
-    if (next >= commandSteps.length) return
-    setStepIndex(next)
-    runStep(commandSteps[next])
+    const nextIndex = stepIndex + 1
+    if (nextIndex >= commandSteps.length) return
+
+    setStepIndex(nextIndex)
+    runStep(commandSteps[nextIndex])
   }
 
-  // Dismisses the AI's output once its steps are done.
   const clearCommand = () => {
     setCommandMessage('')
     setCommandStatus(null)
@@ -1069,7 +1372,16 @@ function App() {
       const response = await fetch(`${API_BASE_URL}/api/interpret`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ command: text, muscles: muscles.map((muscle) => muscle.displayName) }),
+        body: JSON.stringify({
+          command: text,
+          // Keep this field for the existing server.
+          muscles: muscles.map((muscle) => muscle.displayName),
+          // A future generic server can use this without another App.jsx change.
+          structures: structures.map((structure) => ({
+            name: structure.displayName,
+            category: structure.category,
+          })),
+        }),
       })
 
       if (!response.ok) throw new Error(`Request failed (${response.status})`)
@@ -1077,14 +1389,12 @@ function App() {
       const data = await response.json()
       beginSteps(data.content)
       setCommandText('')
-    } catch (err) {
+    } catch (error) {
       setCommandStatus('error')
-      setCommandMessage(err.message || 'Something went wrong.')
+      setCommandMessage(error.message || 'Something went wrong.')
     }
   }
 
-  // Runs EXAMPLE_RESPONSE through the exact same path a real API response
-  // takes, so the command bar can be tried without ANTHROPIC_API_KEY set up.
   const tryExample = () => {
     beginSteps(EXAMPLE_RESPONSE.content)
   }
@@ -1101,26 +1411,35 @@ function App() {
           <Bounds fit clip margin={1.18}>
             <Center>
               <group rotation={[-Math.PI / 2, 0, 0]}>
-                <SkeletonModel opacity={skeletonOpacity} />
-                <AnatomyModel
-                  opacity={anatomyOpacity}
-                  selectedMuscle={selectedMuscle}
-                  hoveredId={hoveredId}
-                  hiddenIds={hiddenIds}
-                  muscleColors={muscleColors}
-                  selectedIds={selectedIds}
-                  showOnlySelected={showOnlySelected}
-                  highlightSelected={highlightSelected}
-                  onReady={setMuscles}
-                  onSelect={handleMuscleClick}
-                  onHover={setHoveredId}
-                />
+                {MODEL_CONFIGS.map((config) => (
+                  <StructureModel
+                    key={config.key}
+                    config={config}
+                    opacity={modelOpacities[config.key]}
+                    selectedStructure={selectedStructure}
+                    hoveredId={hoveredId}
+                    hiddenIds={hiddenIds}
+                    structureColors={structureColors}
+                    selectedIds={selectedIds}
+                    showOnlySelected={showOnlySelected}
+                    highlightSelected={highlightSelected}
+                    onReady={handleModelReady}
+                    onSelect={handleStructureClick}
+                    onHover={setHoveredId}
+                  />
+                ))}
               </group>
             </Center>
           </Bounds>
         </Suspense>
 
-        <OrbitControls ref={controlsRef} makeDefault enabled={!dragSelectMode} minDistance={0.05} maxDistance={12} />
+        <OrbitControls
+          ref={controlsRef}
+          makeDefault
+          enabled={!dragSelectMode}
+          minDistance={0.05}
+          maxDistance={12}
+        />
         <CameraFocus request={focusRequest} controlsRef={controlsRef} />
         <CameraRefSync cameraRef={cameraRef} />
       </Canvas>
@@ -1130,6 +1449,7 @@ function App() {
         onPointerDown={startDragBox}
         onPointerMove={updateDragBox}
         onPointerUp={finishDragBox}
+        onPointerCancel={() => setDragBox(null)}
         style={{
           position: 'absolute',
           inset: 0,
@@ -1154,7 +1474,10 @@ function App() {
       </div>
 
       <aside style={styles.panel}>
-        <div style={{ fontSize: 19, fontWeight: 700, marginBottom: 14 }}>Muscle Explorer</div>
+        <div style={{ fontSize: 19, fontWeight: 700 }}>Anatomy Explorer</div>
+        <div style={{ ...styles.muted, fontSize: 11, margin: '3px 0 14px' }}>
+          Bone · Muscle · Joint · Ligament
+        </div>
 
         <SearchBox
           value={searchText}
@@ -1175,14 +1498,20 @@ function App() {
           onDone={clearCommand}
         />
 
-        <RangeControl label="Skeleton opacity" value={skeletonOpacity} onChange={setSkeletonOpacity} />
-        <RangeControl label="Muscles opacity" value={anatomyOpacity} onChange={setAnatomyOpacity} />
+        {MODEL_CONFIGS.map((config) => (
+          <RangeControl
+            key={config.key}
+            label={config.label}
+            value={modelOpacities[config.key]}
+            onChange={(opacity) => setModelOpacity(config.key, opacity)}
+          />
+        ))}
 
         <div style={{ ...styles.card, margin: '14px 0' }}>
           <span>
-            <strong>Hidden muscles</strong>
+            <strong>Hidden structures</strong>
             <div style={{ ...styles.muted, fontSize: 11, marginTop: 2 }}>
-              {hiddenIds.size} muscle{hiddenIds.size === 1 ? '' : 's'} hidden
+              {hiddenIds.size} structure{hiddenIds.size === 1 ? '' : 's'} hidden
             </div>
           </span>
 
@@ -1199,13 +1528,23 @@ function App() {
 
         <div style={{ ...styles.card, marginBottom: 14 }}>
           <span>
-            <strong>Selected muscles</strong>
+            <strong>Selected structures</strong>
             <div style={{ ...styles.muted, fontSize: 11, marginTop: 2 }}>
-              {selectedIds.size} muscle{selectedIds.size === 1 ? '' : 's'} selected
+              {selectedIds.size} structure{selectedIds.size === 1 ? '' : 's'} selected
             </div>
           </span>
 
-          <label style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, cursor: 'pointer', marginTop: 9, marginBottom: 7 }}>
+          <label
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: 12,
+              cursor: 'pointer',
+              marginTop: 9,
+              marginBottom: 7,
+            }}
+          >
             <span>Multi-select (click adds to list)</span>
             <input
               type="checkbox"
@@ -1214,16 +1553,37 @@ function App() {
             />
           </label>
 
-          <label style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, cursor: 'pointer', marginBottom: 7 }}>
+          <label
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: 12,
+              cursor: 'pointer',
+              marginBottom: 7,
+            }}
+          >
             <span>Drag-select (draw a box)</span>
             <input
               type="checkbox"
               checked={dragSelectMode}
-              onChange={(event) => setDragSelectMode(event.target.checked)}
+              onChange={(event) => {
+                setDragSelectMode(event.target.checked)
+                setDragBox(null)
+              }}
             />
           </label>
 
-          <label style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, cursor: 'pointer', marginBottom: 7 }}>
+          <label
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: 12,
+              cursor: 'pointer',
+              marginBottom: 7,
+            }}
+          >
             <span>Show only selected</span>
             <input
               type="checkbox"
@@ -1232,7 +1592,16 @@ function App() {
             />
           </label>
 
-          <label style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, cursor: 'pointer', marginBottom: 9 }}>
+          <label
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: 12,
+              cursor: 'pointer',
+              marginBottom: 9,
+            }}
+          >
             <span>Highlight selected</span>
             <input
               type="checkbox"
@@ -1251,30 +1620,34 @@ function App() {
             </button>
           )}
 
-          <SelectedMusclesPanel
-            selectedMuscles={muscles.filter((muscle) => selectedIds.has(muscle.id))}
+          <SelectedStructuresPanel
+            selectedStructures={selectedStructures}
             expandedId={expandedSelectedId}
             hiddenIds={hiddenIds}
-            muscleColors={muscleColors}
-            onToggleExpand={(id) => setExpandedSelectedId((current) => (current === id ? null : id))}
-            onToggleHidden={toggleMuscleHidden}
-            onColorChange={setMuscleColor}
-            onFocus={requestFocus}
-            onRemove={(muscle) => removeSelectedId(muscle.id)}
+            structureColors={structureColors}
+            onToggleExpand={(id) => {
+              setExpandedSelectedId((current) => current === id ? null : id)
+            }}
+            onToggleHidden={toggleStructureHidden}
+            onColorChange={setStructureColor}
+            onFocus={focusStructure}
+            onRemove={(structure) => removeSelectedId(structure.id)}
           />
         </div>
 
-        <MuscleDetails
-          muscle={selectedMuscle}
-          isHidden={selectedMuscle ? hiddenIds.has(selectedMuscle.id) : false}
-          isSelected={selectedMuscle ? selectedIds.has(selectedMuscle.id) : false}
-          selectedColor={selectedMuscle ? muscleColors[selectedMuscle.id] ?? 'original' : 'original'}
+        <StructureDetails
+          structure={selectedStructure}
+          isHidden={selectedStructure ? hiddenIds.has(selectedStructure.id) : false}
+          isSelected={selectedStructure ? selectedIds.has(selectedStructure.id) : false}
+          selectedColor={selectedStructure
+            ? structureColors[selectedStructure.id] ?? 'original'
+            : 'original'}
           onToggleHidden={toggleSelectedHidden}
           onToggleSelected={toggleSelectedInList}
           onColorChange={changeSelectedColor}
-          onFocus={focusSelectedMuscle}
+          onFocus={focusSelectedStructure}
           onDeselect={() => {
-            setSelectedMuscle(null)
+            setSelectedStructure(null)
             setHoveredId(null)
           }}
         />
@@ -1283,7 +1656,6 @@ function App() {
   )
 }
 
-useGLTF.preload('/skeleton.glb')
-useGLTF.preload('/anatomy.glb')
+MODEL_CONFIGS.forEach((config) => useGLTF.preload(config.url))
 
 export default App
