@@ -138,14 +138,14 @@ function formatStructureName(name) {
   let cleaned = name.trim()
   let side = ''
 
-  if (/\.r$/i.test(cleaned)) {
-    cleaned = cleaned.replace(/\.r$/i, '')
+  if (/(?:_right|\.r)$/i.test(cleaned)) {
+    cleaned = cleaned.replace(/(?:_right|\.r)$/i, '')
     side = 'Right'
-  } else if (/\.l$/i.test(cleaned)) {
-    cleaned = cleaned.replace(/\.l$/i, '')
+  } else if (/(?:_left|\.l)$/i.test(cleaned)) {
+    cleaned = cleaned.replace(/(?:_left|\.l)$/i, '')
     side = 'Left'
   } else {
-    cleaned = cleaned.replace(/\.g$/i, '')
+    cleaned = cleaned.replace(/(?:_g|\.g)$/i, '')
   }
 
   const words = cleaned
@@ -268,97 +268,180 @@ function getStructureStats(meshes) {
   return { vertices, triangles, dimensions }
 }
 
-function makeStructureRecord(object, meshes, config, fallbackIndex) {
+function makeStructureRecord(
+  owner,
+  meshes,
+  config,
+  fallbackIndex,
+  nodeMetadata = {},
+) {
   const representativeMesh = meshes[0]
+
   const rawName = (
-    object.name?.trim() ||
+    nodeMetadata.ownerName?.trim() ||
+    owner.name?.trim() ||
     representativeMesh?.name?.trim() ||
     `Unnamed ${config.defaultCategory || 'structure'} ${fallbackIndex}`
   )
+
   const displayName = formatStructureName(rawName)
-  const categorySource = object.name ? object : representativeMesh
+
   const category = config.key === 'joints'
-    ? classifyJointCategory(categorySource)
+    ? classifyJointCategory(owner)
     : config.defaultCategory
 
-  const groupKey = category === 'Muscle' ? classifyMuscleGroup(rawName) : null
-  const muscleGroup = groupKey ? MUSCLE_GROUPS[groupKey] : null
+  const groupKey = category === 'Muscle'
+    ? classifyMuscleGroup(rawName)
+    : null
+
+  const muscleGroup = groupKey
+    ? MUSCLE_GROUPS[groupKey]
+    : null
+
   const groupLabel = muscleGroup?.label ?? null
   const stats = getStructureStats(meshes)
 
+  const structureId = `${config.key}:object:${owner.uuid}`
+
   return {
-    id: `${config.key}:${object.uuid}`,
-    object,
+    id: structureId,
+
+    object: owner,
     mesh: representativeMesh,
     meshes,
+
+    nodeIndex: nodeMetadata.nodeIndex ?? null,
+    meshIndex: nodeMetadata.meshIndex ?? null,
+    ownerName: nodeMetadata.ownerName ?? null,
+
     name: rawName,
     displayName,
     displayLabel: `${displayName} — ${category}`,
-    searchName: `${displayName} ${category} ${config.label} ${groupLabel || ''}`.toLowerCase(),
+
+    searchName: [
+      displayName,
+      rawName,
+      category,
+      config.label,
+      groupLabel || '',
+    ]
+      .join(' ')
+      .toLowerCase(),
+
     category,
     groupLabel,
     sourceKey: config.key,
     sourceLabel: config.sourceLabel,
-    info: category === 'Muscle' ? getMuscleInfo(rawName) : null,
+
+    info: category === 'Muscle'
+      ? getMuscleInfo(rawName)
+      : null,
+
     ...stats,
   }
 }
 
-function prepareModel(scene, config, associations) {
-  // Preserve the source files' shared coordinates and scale. Each GLB is cloned,
-  // but no model-specific normalization is applied.
-  const model = scene.clone(true)
-  const sourceObjects = []
-  const clonedObjects = []
-  scene.traverse((object) => sourceObjects.push(object))
-  model.traverse((object) => clonedObjects.push(object))
+function prepareMeshForInteraction(mesh) {
+  if (!mesh.userData.aiTrainerMaterialsPrepared) {
+    cloneMeshMaterials(mesh)
+    mesh.userData.aiTrainerMaterialsPrepared = true
+  }
 
-  const sourceByClone = new Map()
-  clonedObjects.forEach((object, index) => {
-    sourceByClone.set(object, sourceObjects[index])
-  })
+  if (!mesh.userData.originalRaycast) {
+    mesh.userData.originalRaycast = mesh.raycast
+  }
+}
 
-  const entriesByNode = new Map()
-  const structures = []
-  let fallbackIndex = 0
+function buildStructureEntries(scene, associations) {
+  const entriesByOwner = new Map()
+  const fallbackEntries = []
 
-  model.traverse((mesh) => {
+  scene.traverse((mesh) => {
     if (!mesh.isMesh) return
 
-    cloneMeshMaterials(mesh)
-    mesh.userData.originalRaycast = mesh.raycast
+    prepareMeshForInteraction(mesh)
 
     let owner = mesh
-    let sourceOwner = sourceByClone.get(owner)
-    let association = sourceOwner ? associations?.get(sourceOwner) : null
+    let ownerAssociation = associations?.get(owner)
 
-    // Three.js can split one glTF node into several render meshes when the
-    // source mesh has multiple primitives/materials. Group those meshes back
-    // under the nearest original glTF node, matching the working inspector.
-    while (owner.parent && (!association || association.nodes === undefined)) {
+    /*
+     * Walk upward to the nearest Three.js object corresponding to a glTF node.
+     *
+     * Important: group by the actual owner object, not association.nodes.
+     * In this model, separate left/right owners can incorrectly report the
+     * same node index through parser.associations.
+     */
+    while (
+      owner &&
+      (!ownerAssociation || ownerAssociation.nodes === undefined)
+    ) {
       owner = owner.parent
-      sourceOwner = sourceByClone.get(owner)
-      association = sourceOwner ? associations?.get(sourceOwner) : null
+      ownerAssociation = owner
+        ? associations?.get(owner)
+        : null
     }
 
-    const nodeKey = association?.nodes !== undefined
-      ? `node-${association.nodes}`
-      : `three-${owner.uuid}`
+    if (!owner || !ownerAssociation) {
+      fallbackEntries.push({
+        object: mesh,
+        meshes: [mesh],
+        nodeIndex: null,
+        meshIndex: null,
+        ownerName: mesh.name || null,
+      })
 
-    let entry = entriesByNode.get(nodeKey)
+      return
+    }
+
+    let entry = entriesByOwner.get(owner)
+
     if (!entry) {
-      fallbackIndex += 1
-      entry = { object: owner, meshes: [], fallbackIndex }
-      entriesByNode.set(nodeKey, entry)
+      entry = {
+        object: owner,
+        meshes: [],
+        nodeIndex: ownerAssociation.nodes ?? null,
+        meshIndex: ownerAssociation.meshes ?? null,
+        ownerName: owner.name || null,
+      }
+
+      entriesByOwner.set(owner, entry)
     }
-    entry.meshes.push(mesh)
+
+    if (!entry.meshes.includes(mesh)) {
+      entry.meshes.push(mesh)
+    }
   })
 
-  entriesByNode.forEach(({ object, meshes, fallbackIndex }) => {
-    const rawName = object.name?.trim() || meshes[0]?.name?.trim() || ''
+  return [
+    ...entriesByOwner.values(),
+    ...fallbackEntries,
+  ]
+}
+
+function prepareModel(scene, config, associations) {
+  const model = scene
+  const entries = buildStructureEntries(model, associations)
+  const structures = []
+  entries.forEach((entry, index) => {
+    const {
+      object,
+      meshes,
+      nodeIndex,
+      meshIndex,
+      ownerName,
+    } = entry
+
+    const rawName = (
+      ownerName?.trim() ||
+      object.name?.trim() ||
+      meshes[0]?.name?.trim() ||
+      ''
+    )
+
     const muscleGroupKey = config.key === 'muscles'
       ? classifyMuscleGroup(rawName)
       : null
+
     const muscleGroupColor = muscleGroupKey
       ? MUSCLE_GROUPS[muscleGroupKey]?.color
       : null
@@ -368,21 +451,51 @@ function prepareModel(scene, config, associations) {
         if (muscleGroupColor && material.color) {
           material.color.set(muscleGroupColor)
         }
-        if (material.color) {
-          material.userData.originalColor = material.color.clone()
+
+        if (
+          material.color &&
+          !material.userData.originalColor
+        ) {
+          material.userData.originalColor =
+            material.color.clone()
         }
       })
     })
 
-    const record = makeStructureRecord(object, meshes, config, fallbackIndex)
+    const record = makeStructureRecord(
+      object,
+      meshes,
+      config,
+      index + 1,
+      {
+        nodeIndex,
+        meshIndex,
+        ownerName,
+      },
+    )
+
+    /*
+     * Every render piece inside this glTF node points to the same complete
+     * anatomical structure.
+     */
     meshes.forEach((mesh) => {
       mesh.userData.structure = record
     })
+
     structures.push(record)
   })
 
   model.userData.structures = structures
+
   return model
+}
+
+function findStructureForMesh(model, mesh) {
+  if (!mesh?.isMesh) return null
+
+  return model.userData.structures?.find(
+    (structure) => structure.meshes.includes(mesh),
+  ) ?? null
 }
 
 function setMeshVisible(mesh, visible) {
@@ -499,11 +612,9 @@ function StructureModel({
             material.color.copy(material.userData.originalColor)
           }
 
-          if (id === hoveredId) {
-            material.color.lerp(WHITE, 0.58)
-          } else if (
+          if (
             highlightSelected &&
-            (id === selectedStructure?.id || selectedIds.has(id))
+            structure === selectedStructure
           ) {
             material.color.lerp(WHITE, 0.3)
           }
@@ -528,26 +639,121 @@ function StructureModel({
     highlightSelected,
   ])
 
-  const structureFromEvent = (event) => event.object?.userData?.structure ?? null
+  const getEventStructure = (event) => (
+    findStructureForMesh(model, event.object)
+  )
 
   return (
     <primitive
       object={model}
       onClick={(event) => {
-        const structure = structureFromEvent(event)
-        if (!structure || event.delta > 4) return
+        if (event.delta > 4) return
+
+        const structure = getEventStructure(event)
+        if (!structure) return
+
+        const counterpartName = structure.displayName.startsWith('Left ')
+          ? structure.displayName.replace(/^Left /, 'Right ')
+          : structure.displayName.startsWith('Right ')
+            ? structure.displayName.replace(/^Right /, 'Left ')
+            : null
+
+        const counterpart = counterpartName
+          ? model.userData.structures?.find(
+              (candidate) => candidate.displayName === counterpartName,
+            )
+          : null
+
+        console.log('CLICK COMPARISON', {
+          clicked: {
+            meshName: event.object.name,
+            meshUUID: event.object.uuid,
+            parentName: event.object.parent?.name,
+            parentUUID: event.object.parent?.uuid,
+
+            structureName: structure.displayName,
+            structureId: structure.id,
+            nodeIndex: structure.nodeIndex,
+            objectUUID: structure.object?.uuid,
+
+            meshes: structure.meshes.map((mesh) => ({
+              name: mesh.name,
+              uuid: mesh.uuid,
+              parentName: mesh.parent?.name,
+              geometryUUID: mesh.geometry?.uuid,
+              materialUUIDs: getMaterials(mesh).map(
+                (material) => material.uuid,
+              ),
+            })),
+          },
+          parentAssociations: (() => {
+            const results = []
+
+            model.traverse((object) => {
+              if (
+                object.name === 'Clavicular_part_of_deltoid_muscle_left' ||
+                object.name === 'Clavicular_part_of_deltoid_muscle_right'
+              ) {
+                results.push({
+                  name: object.name,
+                  uuid: object.uuid,
+                  association: parser.associations.get(object) ?? null,
+                  childMeshes: object.children
+                    .filter((child) => child.isMesh)
+                    .map((child) => ({
+                      name: child.name,
+                      uuid: child.uuid,
+                      association: parser.associations.get(child) ?? null,
+                    })),
+                })
+              }
+            })
+
+            return results
+          })(),
+          counterpart: counterpart
+            ? {
+                structureName: counterpart.displayName,
+                structureId: counterpart.id,
+                nodeIndex: counterpart.nodeIndex,
+                objectUUID: counterpart.object?.uuid,
+
+                sameStructureObject: counterpart === structure,
+                sameOwnerObject: counterpart.object === structure.object,
+
+                meshes: counterpart.meshes.map((mesh) => ({
+                  name: mesh.name,
+                  uuid: mesh.uuid,
+                  parentName: mesh.parent?.name,
+                  geometryUUID: mesh.geometry?.uuid,
+                  materialUUIDs: getMaterials(mesh).map(
+                    (material) => material.uuid,
+                  ),
+                })),
+
+                sharedMeshObjects: counterpart.meshes.filter(
+                  (mesh) => structure.meshes.includes(mesh),
+                ).map((mesh) => mesh.uuid),
+
+                sharedMaterialObjects: counterpart.meshes.flatMap(
+                  (counterpartMesh) =>
+                    getMaterials(counterpartMesh)
+                      .filter((counterpartMaterial) =>
+                        structure.meshes.some((selectedMesh) =>
+                          getMaterials(selectedMesh).includes(counterpartMaterial),
+                        ),
+                      )
+                      .map((material) => material.uuid),
+                ),
+              }
+            : null,
+        })
 
         event.stopPropagation()
         onSelect(structure)
       }}
-      onPointerOver={(event) => {
-        const structure = structureFromEvent(event)
-        if (!structure) return
-
-        event.stopPropagation()
-        onHover(structure.id)
-      }}
-      onPointerOut={() => onHover(null)}
+      onPointerOver={() => {}}
+      onPointerOut={() => {}}
     />
   )
 }
@@ -1477,8 +1683,7 @@ function App() {
         <Suspense fallback={null}>
           <Bounds fit margin={1.18}>
             <Center>
-              <group rotation={[-Math.PI / 2, 0, 0]}>
-                {MODEL_CONFIGS.map((config) => (
+              {MODEL_CONFIGS.map((config) => (
                   <StructureModel
                     key={config.key}
                     config={config}
@@ -1494,8 +1699,7 @@ function App() {
                     onSelect={handleStructureClick}
                     onHover={setHoveredId}
                   />
-                ))}
-              </group>
+              ))}
             </Center>
           </Bounds>
         </Suspense>
