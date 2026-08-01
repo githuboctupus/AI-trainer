@@ -8,10 +8,8 @@ import {
   MUSCLE_GROUPS,
 } from './muscleData'
 
-const MODEL_SIZE = 2
 const NO_RAYCAST = () => {}
 const WHITE = new THREE.Color('#ffffff')
-const SELECTED_GRAY = new THREE.Color('#e5e7eb')
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8787'
 
@@ -39,7 +37,6 @@ const MODEL_CONFIGS = [
     url: '/joints_final.glb',
     defaultCategory: null,
     initialOpacity: 1,
-    rotation: [0, 0, 0],
   },
 ]
 
@@ -249,21 +246,51 @@ function getGeometryStats(mesh) {
   return { vertices, triangles, dimensions }
 }
 
-function makeStructureRecord(mesh, config, fallbackIndex) {
-  const rawName = mesh.name?.trim() || `Unnamed ${config.defaultCategory || 'structure'} ${fallbackIndex}`
+function getStructureStats(meshes) {
+  const box = new THREE.Box3()
+  let vertices = 0
+  let triangles = 0
+
+  meshes.forEach((mesh) => {
+    const stats = getGeometryStats(mesh)
+    vertices += stats.vertices
+    triangles += stats.triangles
+    box.expandByObject(mesh)
+  })
+
+  const dimensions = box.isEmpty()
+    ? [0, 0, 0]
+    : box
+        .getSize(new THREE.Vector3())
+        .toArray()
+        .map((value) => Number(value.toFixed(4)))
+
+  return { vertices, triangles, dimensions }
+}
+
+function makeStructureRecord(object, meshes, config, fallbackIndex) {
+  const representativeMesh = meshes[0]
+  const rawName = (
+    object.name?.trim() ||
+    representativeMesh?.name?.trim() ||
+    `Unnamed ${config.defaultCategory || 'structure'} ${fallbackIndex}`
+  )
   const displayName = formatStructureName(rawName)
+  const categorySource = object.name ? object : representativeMesh
   const category = config.key === 'joints'
-    ? classifyJointCategory(mesh)
+    ? classifyJointCategory(categorySource)
     : config.defaultCategory
 
   const groupKey = category === 'Muscle' ? classifyMuscleGroup(rawName) : null
   const muscleGroup = groupKey ? MUSCLE_GROUPS[groupKey] : null
   const groupLabel = muscleGroup?.label ?? null
-  const stats = getGeometryStats(mesh)
+  const stats = getStructureStats(meshes)
 
   return {
-    id: `${config.key}:${mesh.uuid}`,
-    mesh,
+    id: `${config.key}:${object.uuid}`,
+    object,
+    mesh: representativeMesh,
+    meshes,
     name: rawName,
     displayName,
     displayLabel: `${displayName} — ${category}`,
@@ -277,31 +304,58 @@ function makeStructureRecord(mesh, config, fallbackIndex) {
   }
 }
 
-function cloneAndNormalize(scene) {
+function prepareModel(scene, config, associations) {
+  // Preserve the source files' shared coordinates and scale. Each GLB is cloned,
+  // but no model-specific normalization is applied.
   const model = scene.clone(true)
-  const size = new THREE.Box3().setFromObject(model).getSize(new THREE.Vector3())
-  const largestDimension = Math.max(size.x, size.y, size.z)
+  const sourceObjects = []
+  const clonedObjects = []
+  scene.traverse((object) => sourceObjects.push(object))
+  model.traverse((object) => clonedObjects.push(object))
 
-  if (largestDimension > 0) {
-    model.scale.multiplyScalar(MODEL_SIZE / largestDimension)
-  }
+  const sourceByClone = new Map()
+  clonedObjects.forEach((object, index) => {
+    sourceByClone.set(object, sourceObjects[index])
+  })
 
-  return model
-}
-
-function prepareModel(scene, config) {
-  const model = cloneAndNormalize(scene)
+  const entriesByNode = new Map()
   const structures = []
   let fallbackIndex = 0
 
-  model.traverse((child) => {
-    if (!child.isMesh) return
+  model.traverse((mesh) => {
+    if (!mesh.isMesh) return
 
-    fallbackIndex += 1
-    cloneMeshMaterials(child)
-    child.userData.originalRaycast = child.raycast
+    cloneMeshMaterials(mesh)
+    mesh.userData.originalRaycast = mesh.raycast
 
-    const rawName = child.name?.trim() || ''
+    let owner = mesh
+    let sourceOwner = sourceByClone.get(owner)
+    let association = sourceOwner ? associations?.get(sourceOwner) : null
+
+    // Three.js can split one glTF node into several render meshes when the
+    // source mesh has multiple primitives/materials. Group those meshes back
+    // under the nearest original glTF node, matching the working inspector.
+    while (owner.parent && (!association || association.nodes === undefined)) {
+      owner = owner.parent
+      sourceOwner = sourceByClone.get(owner)
+      association = sourceOwner ? associations?.get(sourceOwner) : null
+    }
+
+    const nodeKey = association?.nodes !== undefined
+      ? `node-${association.nodes}`
+      : `three-${owner.uuid}`
+
+    let entry = entriesByNode.get(nodeKey)
+    if (!entry) {
+      fallbackIndex += 1
+      entry = { object: owner, meshes: [], fallbackIndex }
+      entriesByNode.set(nodeKey, entry)
+    }
+    entry.meshes.push(mesh)
+  })
+
+  entriesByNode.forEach(({ object, meshes, fallbackIndex }) => {
+    const rawName = object.name?.trim() || meshes[0]?.name?.trim() || ''
     const muscleGroupKey = config.key === 'muscles'
       ? classifyMuscleGroup(rawName)
       : null
@@ -309,20 +363,21 @@ function prepareModel(scene, config) {
       ? MUSCLE_GROUPS[muscleGroupKey]?.color
       : null
 
-    getMaterials(child).forEach((material) => {
-      material.transparent = true
-
-      if (muscleGroupColor && material.color) {
-        material.color.set(muscleGroupColor)
-      }
-
-      if (material.color) {
-        material.userData.originalColor = material.color.clone()
-      }
+    meshes.forEach((mesh) => {
+      getMaterials(mesh).forEach((material) => {
+        if (muscleGroupColor && material.color) {
+          material.color.set(muscleGroupColor)
+        }
+        if (material.color) {
+          material.userData.originalColor = material.color.clone()
+        }
+      })
     })
 
-    const record = makeStructureRecord(child, config, fallbackIndex)
-    child.userData.structure = record
+    const record = makeStructureRecord(object, meshes, config, fallbackIndex)
+    meshes.forEach((mesh) => {
+      mesh.userData.structure = record
+    })
     structures.push(record)
   })
 
@@ -407,8 +462,11 @@ function StructureModel({
   onSelect,
   onHover,
 }) {
-  const { scene } = useGLTF(config.url)
-  const model = useMemo(() => prepareModel(scene, config), [scene, config])
+  const { scene, parser } = useGLTF(config.url)
+  const model = useMemo(
+    () => prepareModel(scene, config, parser.associations),
+    [scene, config, parser],
+  )
 
   useEffect(() => {
     onReady(config.key, model.userData.structures)
@@ -451,8 +509,11 @@ function StructureModel({
           }
         }
 
+        const isTransparent = opacity < 0.999
+        material.transparent = isTransparent
         material.opacity = opacity
-        material.depthWrite = opacity > 0.95
+        material.depthWrite = !isTransparent
+        material.needsUpdate = true
       })
     })
   }, [
@@ -472,7 +533,6 @@ function StructureModel({
   return (
     <primitive
       object={model}
-      rotation={config.rotation || [0, 0, 0]}
       onClick={(event) => {
         const structure = structureFromEvent(event)
         if (!structure || event.delta > 4) return
@@ -480,7 +540,7 @@ function StructureModel({
         event.stopPropagation()
         onSelect(structure)
       }}
-      onPointerMove={(event) => {
+      onPointerOver={(event) => {
         const structure = structureFromEvent(event)
         if (!structure) return
 
@@ -503,7 +563,7 @@ function CameraFocus({ request, controlsRef }) {
     if (!controls) return
 
     if (request && handledToken.current !== request.token) {
-      const mesh = request.structure?.mesh
+      const mesh = request.structure?.object ?? request.structure?.mesh
       let requestHandled = false
 
       if (mesh && mesh.visible) {
@@ -1194,7 +1254,7 @@ function App() {
       const matches = []
 
       structures.forEach((structure) => {
-        const mesh = structure.mesh
+        const mesh = structure.object ?? structure.mesh
         if (!mesh || !mesh.visible) return
 
         mesh.updateWorldMatrix(true, false)
@@ -1404,14 +1464,18 @@ function App() {
 
   return (
     <div style={styles.app}>
-      <Canvas camera={{ fov: 50, position: [0, 0, 4] }}>
+      <Canvas
+        dpr={[1, 1.5]}
+        gl={{ antialias: true, powerPreference: 'high-performance' }}
+        camera={{ fov: 45, near: 0.001, far: 100000, position: [3, 2, 5] }}
+      >
         <color attach="background" args={['#111827']} />
         <ambientLight intensity={0.9} />
         <directionalLight position={[5, 5, 5]} intensity={1.1} />
         <directionalLight position={[-5, 2, -3]} intensity={0.45} />
 
         <Suspense fallback={null}>
-          <Bounds fit clip margin={1.18}>
+          <Bounds fit margin={1.18}>
             <Center>
               <group rotation={[-Math.PI / 2, 0, 0]}>
                 {MODEL_CONFIGS.map((config) => (
@@ -1440,8 +1504,11 @@ function App() {
           ref={controlsRef}
           makeDefault
           enabled={!dragSelectMode}
-          minDistance={0.05}
-          maxDistance={12}
+          enableDamping
+          dampingFactor={0.08}
+          zoomSpeed={0.6}
+          rotateSpeed={0.7}
+          panSpeed={0.7}
         />
         <CameraFocus request={focusRequest} controlsRef={controlsRef} />
         <CameraRefSync cameraRef={cameraRef} />
