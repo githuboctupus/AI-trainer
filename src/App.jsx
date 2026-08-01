@@ -11,6 +11,7 @@ import {
 const MODEL_SIZE = 2
 const NO_RAYCAST = () => {}
 const WHITE = new THREE.Color('#ffffff')
+const SELECTED_GRAY = new THREE.Color('#e5e7eb')
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8787'
 
@@ -19,7 +20,7 @@ const MODEL_CONFIGS = [
     key: 'bones',
     label: 'Bones',
     sourceLabel: 'Skeleton',
-    url: '/skeleton.glb',
+    url: '/skeleton_final.glb',
     defaultCategory: 'Bone',
     initialOpacity: 1,
   },
@@ -27,7 +28,7 @@ const MODEL_CONFIGS = [
     key: 'muscles',
     label: 'Muscles',
     sourceLabel: 'Muscle model',
-    url: '/anatomy.glb',
+    url: '/muscle_final.glb',
     defaultCategory: 'Muscle',
     initialOpacity: 0.75,
   },
@@ -35,9 +36,10 @@ const MODEL_CONFIGS = [
     key: 'joints',
     label: 'Joints & ligaments',
     sourceLabel: 'Joint model',
-    url: '/joints.glb',
+    url: '/joints_final.glb',
     defaultCategory: null,
     initialOpacity: 1,
+    rotation: [0, 0, 0],
   },
 ]
 
@@ -470,6 +472,7 @@ function StructureModel({
   return (
     <primitive
       object={model}
+      rotation={config.rotation || [0, 0, 0]}
       onClick={(event) => {
         const structure = structureFromEvent(event)
         if (!structure || event.delta > 4) return

@@ -1,18 +1,15 @@
 // Minimal backend for the AI command bar.
 //
-// Why this exists: the Anthropic API key must never be shipped to the
-// browser. This tiny Express server holds the key, calls the Anthropic
-// Messages API with tool definitions, and forwards Claude's response
-// (text + tool_use blocks) straight to the frontend for dispatch.
+// The Anthropic API key must stay on the server. This Express app receives
+// anatomy commands from the frontend, asks Claude to translate them into
+// supported tool calls, and returns the text/tool_use blocks to App.jsx.
 //
 // Run:
 //   cd server
 //   npm install
 //   ANTHROPIC_API_KEY=sk-ant-... npm start
 //
-// The frontend expects this running on http://localhost:8787 by default
-// (see VITE_API_BASE_URL in the Vite app's .env).
-
+// The frontend uses http://localhost:8787 unless VITE_API_BASE_URL is set.
 import express from 'express'
 import cors from 'cors'
 
@@ -22,7 +19,7 @@ const API_KEY = process.env.ANTHROPIC_API_KEY
 
 if (!API_KEY) {
   console.warn(
-    '[warn] ANTHROPIC_API_KEY is not set. Set it in your environment before starting this server.'
+    '[warn] ANTHROPIC_API_KEY is not set. Set it before starting the server.',
   )
 }
 
@@ -30,114 +27,258 @@ const app = express()
 app.use(cors())
 app.use(express.json({ limit: '1mb' }))
 
-const COLOR_ENUM = ['original', '#ef4444', '#f97316', '#eab308', '#22c55e', '#06b6d4', '#3b82f6', '#a855f7', '#ec4899']
+const COLOR_ENUM = [
+  'original',
+  '#ef4444',
+  '#f97316',
+  '#eab308',
+  '#22c55e',
+  '#06b6d4',
+  '#3b82f6',
+  '#a855f7',
+  '#ec4899',
+]
 
-// One tool per action App.jsx already supports. Descriptions do the
-// prompting here — Claude reads these directly, no separate instructions
-// needed for what each one does.
+const structureInput = {
+  type: 'object',
+  properties: {
+    structure: {
+      type: 'string',
+      description: 'Exact anatomy structure name supplied by the application.',
+    },
+  },
+  required: ['structure'],
+}
+
+const muscleInput = {
+  type: 'object',
+  properties: {
+    muscle: {
+      type: 'string',
+      description: 'Exact muscle name supplied by the application.',
+    },
+  },
+  required: ['muscle'],
+}
+
 const TOOLS = [
+  // Anatomy-wide tools used for bones, muscles, joints, ligaments, and other
+  // joint structures.
+  {
+    name: 'select_structure',
+    description: 'Select one anatomy structure without moving the camera.',
+    input_schema: structureInput,
+  },
+  {
+    name: 'focus_structure',
+    description: 'Select one anatomy structure and move the camera to frame it.',
+    input_schema: structureInput,
+  },
+  {
+    name: 'hide_structure',
+    description: 'Hide one anatomy structure.',
+    input_schema: structureInput,
+  },
+  {
+    name: 'show_structure',
+    description: 'Show one previously hidden anatomy structure.',
+    input_schema: structureInput,
+  },
+  {
+    name: 'set_structure_color',
+    description: 'Set the display color of one anatomy structure.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        structure: structureInput.properties.structure,
+        color: { type: 'string', enum: COLOR_ENUM },
+      },
+      required: ['structure', 'color'],
+    },
+  },
+  {
+    name: 'reset_structure_color',
+    description: 'Restore one anatomy structure to its original color.',
+    input_schema: structureInput,
+  },
+  {
+    name: 'add_to_selected',
+    description: 'Add one anatomy structure to the selected/isolation list.',
+    input_schema: structureInput,
+  },
+  {
+    name: 'remove_from_selected',
+    description: 'Remove one anatomy structure from the selected/isolation list.',
+    input_schema: structureInput,
+  },
+  {
+    name: 'set_isolate_mode',
+    description: "Turn 'show only selected' isolation mode on or off.",
+    input_schema: {
+      type: 'object',
+      properties: { enabled: { type: 'boolean' } },
+      required: ['enabled'],
+    },
+  },
+  {
+    name: 'clear_selected_list',
+    description: 'Remove every structure from the selected/isolation list.',
+    input_schema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'show_all_structures',
+    description: 'Unhide every hidden anatomy structure.',
+    input_schema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'deselect_structure',
+    description: 'Clear the current anatomy structure selection.',
+    input_schema: { type: 'object', properties: {} },
+  },
+
+  // Legacy muscle tools remain available so old prompts, examples, and older
+  // frontend versions continue to work.
   {
     name: 'select_muscle',
     description: 'Select a muscle without moving the camera.',
-    input_schema: { type: 'object', properties: { muscle: { type: 'string' } }, required: ['muscle'] },
+    input_schema: muscleInput,
   },
   {
     name: 'focus_muscle',
     description: 'Select a muscle and move the camera to frame it.',
-    input_schema: { type: 'object', properties: { muscle: { type: 'string' } }, required: ['muscle'] },
+    input_schema: muscleInput,
   },
   {
     name: 'hide_muscle',
-    description: 'Hide a muscle from view.',
-    input_schema: { type: 'object', properties: { muscle: { type: 'string' } }, required: ['muscle'] },
+    description: 'Hide a muscle.',
+    input_schema: muscleInput,
   },
   {
     name: 'show_muscle',
-    description: 'Unhide a previously hidden muscle.',
-    input_schema: { type: 'object', properties: { muscle: { type: 'string' } }, required: ['muscle'] },
+    description: 'Show a previously hidden muscle.',
+    input_schema: muscleInput,
   },
   {
     name: 'set_muscle_color',
-    description: "Set a muscle's color.",
+    description: "Set a muscle's display color.",
     input_schema: {
       type: 'object',
-      properties: { muscle: { type: 'string' }, color: { type: 'string', enum: COLOR_ENUM } },
+      properties: {
+        muscle: muscleInput.properties.muscle,
+        color: { type: 'string', enum: COLOR_ENUM },
+      },
       required: ['muscle', 'color'],
     },
   },
   {
     name: 'reset_muscle_color',
-    description: "Reset a muscle to its original color.",
-    input_schema: { type: 'object', properties: { muscle: { type: 'string' } }, required: ['muscle'] },
+    description: 'Restore a muscle to its original color.',
+    input_schema: muscleInput,
   },
   {
     name: 'add_to_isolated',
-    description: 'Add a muscle to the isolation list.',
-    input_schema: { type: 'object', properties: { muscle: { type: 'string' } }, required: ['muscle'] },
+    description: 'Add a muscle to the selected/isolation list.',
+    input_schema: muscleInput,
   },
   {
     name: 'remove_from_isolated',
-    description: 'Remove a muscle from the isolation list.',
-    input_schema: { type: 'object', properties: { muscle: { type: 'string' } }, required: ['muscle'] },
-  },
-  {
-    name: 'set_isolate_mode',
-    description: "Turn 'render isolated only' mode on or off.",
-    input_schema: { type: 'object', properties: { enabled: { type: 'boolean' } }, required: ['enabled'] },
+    description: 'Remove a muscle from the selected/isolation list.',
+    input_schema: muscleInput,
   },
   {
     name: 'clear_isolated_list',
-    description: 'Empty the isolation list.',
+    description: 'Remove every structure from the selected/isolation list.',
     input_schema: { type: 'object', properties: {} },
   },
   {
     name: 'show_all_muscles',
-    description: 'Unhide every hidden muscle.',
+    description: 'Unhide every hidden muscle while leaving other categories unchanged.',
     input_schema: { type: 'object', properties: {} },
   },
   {
     name: 'deselect_muscle',
-    description: 'Clear the current muscle selection.',
+    description: 'Clear the current selection when it is a muscle.',
     input_schema: { type: 'object', properties: {} },
   },
 ]
 
 const TOOL_NAMES = new Set(TOOLS.map((tool) => tool.name))
 
-function buildSystemPrompt(muscles) {
-  return `You control a 3D muscle anatomy viewer. Use the provided tools to carry out the user's \
-instruction — call one tool per action needed. For a group request (e.g. "hamstrings", \
-"everything on the left arm"), call the matching tool once per muscle in the list below. \
-"muscle" arguments must exactly match a name from this list (case-insensitive) — never invent one; \
-skip anything with no plausible match. Also give a short (under ~15 words) plain-text reply \
-confirming what you did.
+function normalizeStructures(structures, muscles) {
+  if (Array.isArray(structures) && structures.length > 0) {
+    return structures
+      .filter((item) => item && typeof item.name === 'string' && item.name.trim())
+      .map((item) => ({
+        name: item.name.trim(),
+        category:
+          typeof item.category === 'string' && item.category.trim()
+            ? item.category.trim()
+            : 'Structure',
+      }))
+  }
 
-Muscle list (${muscles.length} names):
-${JSON.stringify(muscles)}`
+  // Compatibility with an older frontend that only sends muscle names.
+  if (Array.isArray(muscles)) {
+    return muscles
+      .filter((name) => typeof name === 'string' && name.trim())
+      .map((name) => ({ name: name.trim(), category: 'Muscle' }))
+  }
+
+  return []
 }
 
-// Keeps only tool_use blocks with a name we actually defined, and drops
-// unexpected input fields — cheap insurance against a malformed response.
+function buildSystemPrompt(structures) {
+  const namesByCategory = structures.reduce((groups, structure) => {
+    const category = structure.category || 'Structure'
+    if (!groups[category]) groups[category] = []
+    groups[category].push(structure.name)
+    return groups
+  }, {})
+
+  return `You control a 3D anatomy viewer containing bones, muscles, joints, ligaments, and related structures.
+
+Use the provided tools to perform the user's instruction. Use one tool call per individual action and per individual structure. For requests involving several structures or a group, call the appropriate tool once for every clear matching structure.
+
+Prefer the generic *_structure tools for all new commands, including commands about muscles. The legacy *_muscle tools exist only for backward compatibility.
+
+The "structure" argument must exactly match one name from the categorized list below, case-insensitively. Never invent a structure name. Use category words in the user's request to disambiguate similarly named items. If no plausible structure matches, do not issue a tool call for it.
+
+Keep any plain-text confirmation brief, ideally under 15 words.
+
+Available anatomy structures (${structures.length} total):
+${JSON.stringify(namesByCategory)}`
+}
+
 function sanitizeContent(content) {
   if (!Array.isArray(content)) return []
+
   return content.filter((block) => {
-    if (block.type === 'text') return true
-    if (block.type === 'tool_use') return TOOL_NAMES.has(block.name)
+    if (block?.type === 'text' && typeof block.text === 'string') return true
+    if (block?.type === 'tool_use' && TOOL_NAMES.has(block.name)) return true
     return false
   })
 }
 
 app.post('/api/interpret', async (req, res) => {
-  const { command, muscles } = req.body || {}
+  const { command, muscles, structures: requestedStructures } = req.body || {}
 
   if (typeof command !== 'string' || !command.trim()) {
-    return res.status(400).json({ error: 'Missing "command" string in request body.' })
+    return res.status(400).json({
+      error: 'Missing "command" string in request body.',
+    })
   }
-  if (!Array.isArray(muscles) || muscles.length === 0) {
-    return res.status(400).json({ error: 'Missing "muscles" list in request body.' })
+
+  const structures = normalizeStructures(requestedStructures, muscles)
+  if (structures.length === 0) {
+    return res.status(400).json({
+      error: 'Missing "structures" or legacy "muscles" list in request body.',
+    })
   }
+
   if (!API_KEY) {
-    return res.status(500).json({ error: 'Server is missing ANTHROPIC_API_KEY.' })
+    return res.status(500).json({
+      error: 'Server is missing ANTHROPIC_API_KEY.',
+    })
   }
 
   try {
@@ -151,23 +292,27 @@ app.post('/api/interpret', async (req, res) => {
       body: JSON.stringify({
         model: MODEL,
         max_tokens: 1024,
-        system: buildSystemPrompt(muscles),
+        system: buildSystemPrompt(structures),
         tools: TOOLS,
-        messages: [{ role: 'user', content: command }],
+        messages: [{ role: 'user', content: command.trim() }],
       }),
     })
 
     if (!response.ok) {
-      const errText = await response.text()
-      console.error('Anthropic API error:', response.status, errText)
-      return res.status(502).json({ error: 'The AI service returned an error.' })
+      const errorText = await response.text()
+      console.error('Anthropic API error:', response.status, errorText)
+      return res.status(502).json({
+        error: 'The AI service returned an error.',
+      })
     }
 
     const data = await response.json()
     return res.json({ content: sanitizeContent(data.content) })
-  } catch (err) {
-    console.error(err)
-    return res.status(500).json({ error: 'Unexpected server error.' })
+  } catch (error) {
+    console.error(error)
+    return res.status(500).json({
+      error: 'Unexpected server error.',
+    })
   }
 })
 
