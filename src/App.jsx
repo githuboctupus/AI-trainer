@@ -581,6 +581,8 @@ function StructureModel({
   onReady,
   onSelect,
   onHover,
+  customGroups,
+  showOnlyCustomGroupName,
 }) {
   const { scene, parser } = useGLTF(config.url)
   const model = useMemo(
@@ -600,10 +602,15 @@ function StructureModel({
       if (!structure) return
 
       const id = structure.id
+      const customGroupIds = showOnlyCustomGroupName
+        ? customGroups[showOnlyCustomGroupName]
+        : null
+
       const visible = (
         opacity > 0 &&
         !hiddenIds.has(id) &&
-        (!showOnlySelected || selectedIds.has(id))
+        (!showOnlySelected || selectedIds.has(id)) &&
+        (!customGroupIds || customGroupIds.has(id))
       )
 
       setMeshVisible(child, visible)
@@ -644,6 +651,8 @@ function StructureModel({
     selectedIds,
     showOnlySelected,
     highlightSelected,
+    customGroups,
+    showOnlyCustomGroupName,
   ])
 
   const getEventStructure = (event) => (
@@ -1236,6 +1245,8 @@ function SelectedStructuresPanel({
   expandedId,
   hiddenIds,
   structureColors,
+  customGroups,
+  onAddToGroup,
   onToggleExpand,
   onToggleHidden,
   onColorChange,
@@ -1288,9 +1299,10 @@ function SelectedStructuresPanel({
                 onFocus={() => onFocus(structure)}
                 onDeselect={() => onRemove(structure)}
                 customGroups={customGroups}
-                onAddToGroup={(groupName) =>
+                onAddToGroup={(groupName) => {
+                  if (!selectedStructure) return
                   addStructureToGroup(groupName, selectedStructure.id)
-                }
+                }}
               />
             )}
           </div>
@@ -1321,6 +1333,7 @@ function App() {
   const [selectedIds, setSelectedIds] = useState(() => new Set())
   const [customGroups, setCustomGroups] = useState({})
   const [newGroupName, setNewGroupName] = useState('')
+  const [showOnlyCustomGroupName, setShowOnlyCustomGroupName] = useState(null)
   const [expandedSelectedId, setExpandedSelectedId] = useState(null)
   const [multiSelectMode, setMultiSelectMode] = useState(false)
   const [dragSelectMode, setDragSelectMode] = useState(false)
@@ -1533,15 +1546,9 @@ function App() {
     })
   }
 
-  const showOnlyCustomGroup = (groupName) => {
-    const ids = customGroups[groupName] || new Set()
-
-    setHiddenIds(
-      new Set(
-        structures
-          .filter((structure) => !ids.has(structure.id))
-          .map((structure) => structure.id),
-      ),
+  const toggleShowOnlyCustomGroup = (groupName) => {
+    setShowOnlyCustomGroupName((current) =>
+      current === groupName ? null : groupName
     )
   }
   const toggleSelectedInList = () => {
@@ -1847,6 +1854,8 @@ function App() {
                     structureColors={structureColors}
                     selectedIds={selectedIds}
                     showOnlySelected={showOnlySelected}
+                    customGroups={customGroups}
+                    showOnlyCustomGroupName={showOnlyCustomGroupName}
                     highlightSelected={highlightSelected}
                     onReady={handleModelReady}
                     onSelect={handleStructureClick}
@@ -2131,6 +2140,8 @@ function App() {
             onColorChange={setStructureColor}
             onFocus={focusStructure}
             onRemove={(structure) => removeSelectedId(structure.id)}
+            customGroups={customGroups}
+            onAddToGroup={addStructureToGroup}
           />
         </div>
         <div style={{ ...styles.card, marginBottom: 14 }}>
@@ -2208,10 +2219,10 @@ function App() {
 
                   <button
                     type="button"
-                    onClick={() => showOnlyCustomGroup(groupName)}
+                    onClick={() => toggleShowOnlyCustomGroup(groupName)}
                     style={styles.button}
                   >
-                    Show only
+                    {showOnlyCustomGroupName === groupName ? 'Show all' : 'Show only'}
                   </button>
 
                   <button
@@ -2285,7 +2296,7 @@ function App() {
           }}
           customGroups={customGroups}
           onAddToGroup={(groupName) =>
-            addStructureToGroup(groupName, structure.id)
+            onAddToGroup(groupName, structure.id)
           }
         />
       </aside>
