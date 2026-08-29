@@ -1299,10 +1299,9 @@ function SelectedStructuresPanel({
                 onFocus={() => onFocus(structure)}
                 onDeselect={() => onRemove(structure)}
                 customGroups={customGroups}
-                onAddToGroup={(groupName) => {
-                  if (!selectedStructure) return
-                  addStructureToGroup(groupName, selectedStructure.id)
-                }}
+                onAddToGroup={(groupName) =>
+                  onAddToGroup(groupName, structure.id)
+                }
               />
             )}
           </div>
@@ -2296,7 +2295,7 @@ function App() {
           }}
           customGroups={customGroups}
           onAddToGroup={(groupName) =>
-            onAddToGroup(groupName, structure.id)
+            addStructureToGroup(groupName, selectedStructure.id)
           }
         />
       </aside>
