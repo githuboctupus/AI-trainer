@@ -44,7 +44,8 @@ const structureInput = {
   properties: {
     structure: {
       type: 'string',
-      description: 'Exact anatomy structure name supplied by the application.',
+      description:
+        'Standard scientific anatomical structure name. Use lowercase. For muscles with separately named parts or heads, specify the exact anatomical part or head.',
     },
   },
   required: ['structure'],
@@ -227,26 +228,25 @@ function normalizeStructures(structures, muscles) {
   return []
 }
 
-function buildSystemPrompt(structures) {
-  const namesByCategory = structures.reduce((groups, structure) => {
-    const category = structure.category || 'Structure'
-    if (!groups[category]) groups[category] = []
-    groups[category].push(structure.name)
-    return groups
-  }, {})
+function buildSystemPrompt() {
+  return `You control a 3D anatomy viewer containing bones, muscles, joints, ligaments, tendons, cartilage, and related anatomical structures.
 
-  return `You control a 3D anatomy viewer containing bones, muscles, joints, ligaments, and related structures.
+Use the provided tools to perform the user's instruction.
 
-Use the provided tools to perform the user's instruction. Use one tool call per individual action and per individual structure. For requests involving several structures or a group, call the appropriate tool once for every clear matching structure.
+Prefer the generic *_structure tools for all new commands, including muscles.
 
-Prefer the generic *_structure tools for all new commands, including commands about muscles. The legacy *_muscle tools exist only for backward compatibility.
+When naming anatomy structures:
+- Use standard scientific anatomical names.
+- Put structure names in lowercase.
+- Include left or right when the user specifies a side.
+- Do not use casual muscle-group names such as "quads", "hamstrings", or "biceps" as structure names.
+- When a muscle has separately represented anatomical parts or heads, use the exact part/head rather than the general muscle name.
+- For example, use "right clavicular part of deltoid muscle" rather than "right deltoid".
+- If the requested muscle is ambiguous because multiple separately represented parts could match, ask the user to clarify instead of guessing.
 
-The "structure" argument must exactly match one name from the categorized list below, case-insensitively. Never invent a structure name. Use category words in the user's request to disambiguate similarly named items. If no plausible structure matches, do not issue a tool call for it.
+Use one tool call per individual action and per individual anatomical structure.
 
-Keep any plain-text confirmation brief, ideally under 15 words.
-
-Available anatomy structures (${structures.length} total):
-${JSON.stringify(namesByCategory)}`
+Keep plain-text confirmations brief.`
 }
 
 function sanitizeContent(content) {
@@ -260,7 +260,7 @@ function sanitizeContent(content) {
 }
 
 app.post('/api/interpret', async (req, res) => {
-  const { command, muscles, structures: requestedStructures } = req.body || {}
+  const { command } = req.body || {}
 
   if (typeof command !== 'string' || !command.trim()) {
     return res.status(400).json({
@@ -268,12 +268,12 @@ app.post('/api/interpret', async (req, res) => {
     })
   }
 
-  const structures = normalizeStructures(requestedStructures, muscles)
-  if (structures.length === 0) {
-    return res.status(400).json({
-      error: 'Missing "structures" or legacy "muscles" list in request body.',
-    })
-  }
+  // const structures = normalizeStructures(requestedStructures, muscles)
+  // if (structures.length === 0) {
+  //   return res.status(400).json({
+  //     error: 'Missing "structures" or legacy "muscles" list in request body.',
+  //   })
+  // }
 
   if (!API_KEY) {
     return res.status(500).json({
@@ -292,7 +292,7 @@ app.post('/api/interpret', async (req, res) => {
       body: JSON.stringify({
         model: MODEL,
         max_tokens: 1024,
-        system: buildSystemPrompt(structures),
+        system: buildSystemPrompt(),
         tools: TOOLS,
         messages: [{ role: 'user', content: command.trim() }],
       }),

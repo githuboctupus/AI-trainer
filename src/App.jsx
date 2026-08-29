@@ -42,19 +42,26 @@ const MODEL_CONFIGS = [
 
 const EXAMPLE_RESPONSE = {
   content: [
-    { type: 'text', text: 'Focusing the right biceps.' },
-    { type: 'tool_use', name: 'focus_muscle', input: { muscle: 'right biceps brachii' } },
-    { type: 'text', text: 'Hiding the left hamstring.' },
-    { type: 'tool_use', name: 'hide_muscle', input: { muscle: 'left biceps femoris' } },
-    { type: 'text', text: 'Hiding the right hamstring.' },
-    { type: 'tool_use', name: 'hide_muscle', input: { muscle: 'right biceps femoris' } },
-    { type: 'text', text: 'Actually, showing the left hamstring again.' },
-    { type: 'tool_use', name: 'show_muscle', input: { muscle: 'left biceps femoris' } },
-    { type: 'text', text: 'Coloring the right quads red.' },
+    {
+      type: 'text',
+      text: 'Focusing the right clavicular part of the deltoid.',
+    },
     {
       type: 'tool_use',
-      name: 'set_muscle_color',
-      input: { muscle: 'right rectus femoris', color: '#ef4444' },
+      name: 'focus_structure',
+      input: { structure: 'right clavicular part of deltoid muscle' },
+    },
+    {
+      type: 'text',
+      text: 'Coloring the right supraspinatus blue.',
+    },
+    {
+      type: 'tool_use',
+      name: 'set_structure_color',
+      input: {
+        structure: 'right supraspinatus muscle',
+        color: '#3b82f6',
+      },
     },
   ],
 }
@@ -968,7 +975,7 @@ function AICommandBar({
             onSubmit()
           }
         }}
-        placeholder='e.g. "hide the forearms and color the quads red"'
+        placeholder='e.g. "focus on the right clavicular part of the deltoid muscle and color the right supraspinatus blue"'
         rows={2}
         style={{ ...styles.input, resize: 'vertical', marginBottom: 8 }}
       />
@@ -1644,12 +1651,12 @@ function App() {
         body: JSON.stringify({
           command: text,
           // Keep this field for the existing server.
-          muscles: muscles.map((muscle) => muscle.displayName),
-          // A future generic server can use this without another App.jsx change.
-          structures: structures.map((structure) => ({
-            name: structure.displayName,
-            category: structure.category,
-          })),
+          // muscles: muscles.map((muscle) => muscle.displayName),
+          // // A future generic server can use this without another App.jsx change.
+          // structures: structures.map((structure) => ({
+          //   name: structure.displayName,
+          //   category: structure.category,
+          // })),
         }),
       })
 
