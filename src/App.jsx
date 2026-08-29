@@ -1038,12 +1038,15 @@ function StructureDetails({
   isHidden,
   isSelected,
   selectedColor,
+  customGroups,
+  onAddToGroup,
   onToggleHidden,
   onToggleSelected,
   onColorChange,
   onFocus,
   onDeselect,
 }) {
+  const [selectedGroupName, setSelectedGroupName] = useState('')
   if (!structure) {
     return (
       <div
@@ -1096,7 +1099,46 @@ function StructureDetails({
           {isSelected ? 'Remove from selected list' : 'Add to selected list'}
         </button>
       </div>
+      {Object.keys(customGroups).length > 0 && (
+        <div style={{ display: 'flex', gap: 6, marginBottom: 12 }}>
+          <select
+            value={selectedGroupName}
+            onChange={(event) => setSelectedGroupName(event.target.value)}
+            style={{
+              ...styles.input,
+              marginBottom: 0,
+              background: '#1f1f1f',
+              color: '#fff',
+            }}
+          >
+            <option value="" style={{ background: '#1f1f1f', color: '#fff' }}>
+              Select custom group...
+            </option>
 
+            {Object.keys(customGroups).map((groupName) => (
+              <option
+                key={groupName}
+                value={groupName}
+                style={{ background: '#1f1f1f', color: '#fff' }}
+              >
+                {groupName}
+              </option>
+            ))}
+          </select>
+
+          <button
+            type="button"
+            disabled={!selectedGroupName}
+            onClick={() => {
+              onAddToGroup(selectedGroupName)
+              setSelectedGroupName('')
+            }}
+            style={styles.button}
+          >
+            Add
+          </button>
+        </div>
+      )}
       <div style={{ marginBottom: 14 }}>
         <div
           style={{
@@ -1245,6 +1287,10 @@ function SelectedStructuresPanel({
                 onColorChange={(color) => onColorChange(structure, color)}
                 onFocus={() => onFocus(structure)}
                 onDeselect={() => onRemove(structure)}
+                customGroups={customGroups}
+                onAddToGroup={(groupName) =>
+                  addStructureToGroup(groupName, selectedStructure.id)
+                }
               />
             )}
           </div>
@@ -1273,6 +1319,8 @@ function App() {
   const [stepIndex, setStepIndex] = useState(0)
 
   const [selectedIds, setSelectedIds] = useState(() => new Set())
+  const [customGroups, setCustomGroups] = useState({})
+  const [newGroupName, setNewGroupName] = useState('')
   const [expandedSelectedId, setExpandedSelectedId] = useState(null)
   const [multiSelectMode, setMultiSelectMode] = useState(false)
   const [dragSelectMode, setDragSelectMode] = useState(false)
@@ -1305,6 +1353,19 @@ function App() {
   const selectedStructures = useMemo(
     () => structures.filter((structure) => selectedIds.has(structure.id)),
     [structures, selectedIds],
+  )
+  const hiddenStructures = useMemo(
+    () => structures.filter((structure) => hiddenIds.has(structure.id)),
+    [structures, hiddenIds],
+  )
+
+  const coloredStructures = useMemo(
+    () => structures.filter(
+      (structure) =>
+        structureColors[structure.id] &&
+        structureColors[structure.id] !== 'original',
+    ),
+    [structures, structureColors],
   )
 
   const searchResults = useMemo(() => {
@@ -1372,10 +1433,17 @@ function App() {
   }
 
   const setStructureColor = (structure, color) => {
-    setStructureColors((current) => ({
-      ...current,
-      [structure.id]: color,
-    }))
+    setStructureColors((current) => {
+      const next = { ...current }
+
+      if (!color || color === 'original') {
+        delete next[structure.id]
+      } else {
+        next[structure.id] = color
+      }
+
+      return next
+    })
   }
 
   const toggleSelectedHidden = () => {
@@ -1399,7 +1467,83 @@ function App() {
       return next
     })
   }
+  const createCustomGroup = () => {
+    const name = newGroupName.trim()
+    if (!name || customGroups[name]) return
 
+    setCustomGroups((current) => ({
+      ...current,
+      [name]: new Set(),
+    }))
+
+    setNewGroupName('')
+  }
+
+  const addStructureToGroup = (groupName, structureId) => {
+    setCustomGroups((current) => ({
+      ...current,
+      [groupName]: new Set([
+        ...(current[groupName] || []),
+        structureId,
+      ]),
+    }))
+  }
+
+  const removeStructureFromGroup = (groupName, structureId) => {
+    setCustomGroups((current) => {
+      const nextGroup = new Set(current[groupName])
+      nextGroup.delete(structureId)
+
+      return {
+        ...current,
+        [groupName]: nextGroup,
+      }
+    })
+  }
+
+  const deleteCustomGroup = (groupName) => {
+    setCustomGroups((current) => {
+      const next = { ...current }
+      delete next[groupName]
+      return next
+    })
+  }
+
+  const selectCustomGroup = (groupName) => {
+    setSelectedIds(new Set(customGroups[groupName] || []))
+  }
+
+  const hideCustomGroup = (groupName) => {
+    setHiddenIds((current) => {
+      const next = new Set(current)
+
+      customGroups[groupName]?.forEach((id) => next.add(id))
+
+      return next
+    })
+  }
+
+  const showCustomGroup = (groupName) => {
+    setHiddenIds((current) => {
+      const next = new Set(current)
+
+      customGroups[groupName]?.forEach((id) => next.delete(id))
+
+      return next
+    })
+  }
+
+  const showOnlyCustomGroup = (groupName) => {
+    const ids = customGroups[groupName] || new Set()
+
+    setHiddenIds(
+      new Set(
+        structures
+          .filter((structure) => !ids.has(structure.id))
+          .map((structure) => structure.id),
+      ),
+    )
+  }
   const toggleSelectedInList = () => {
     if (!selectedStructure) return
     toggleSelectedId(selectedStructure.id)
@@ -1415,10 +1559,12 @@ function App() {
   }
 
   const handleStructureClick = (structure) => {
+    setSelectedStructure(structure)
+
     if (multiSelectMode) {
       toggleSelectedId(structure.id)
     } else {
-      selectStructure(structure)
+      setSelectedIds(new Set([structure.id]))
     }
   }
 
@@ -1788,25 +1934,97 @@ function App() {
           />
         ))}
 
-        <div style={{ ...styles.card, margin: '14px 0' }}>
-          <span>
+        <details style={{ ...styles.card, margin: '14px 0' }}>
+          <summary style={{ cursor: 'pointer' }}>
             <strong>Hidden structures</strong>
             <div style={{ ...styles.muted, fontSize: 11, marginTop: 2 }}>
-              {hiddenIds.size} structure{hiddenIds.size === 1 ? '' : 's'} hidden
+              {hiddenStructures.length} structure
+              {hiddenStructures.length === 1 ? '' : 's'} hidden
             </div>
-          </span>
+          </summary>
 
-          {hiddenIds.size > 0 && (
-            <button
-              type="button"
-              onClick={() => setHiddenIds(new Set())}
-              style={{ ...styles.button, width: '100%', marginTop: 9 }}
-            >
-              Clear hidden list
-            </button>
+          {hiddenStructures.length > 0 && (
+            <>
+              <button
+                type="button"
+                onClick={() => setHiddenIds(new Set())}
+                style={{ ...styles.button, width: '100%', marginTop: 10 }}
+              >
+                Unhide all
+              </button>
+
+              {hiddenStructures.map((structure) => (
+                <div
+                  key={structure.id}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    gap: 8,
+                    padding: '8px 0',
+                    borderTop: '1px solid rgba(255,255,255,0.12)',
+                  }}
+                >
+                  <span>{structure.displayLabel}</span>
+
+                  <button
+                    type="button"
+                    onClick={() => toggleStructureHidden(structure)}
+                    style={styles.button}
+                  >
+                    Unhide
+                  </button>
+                </div>
+              ))}
+            </>
           )}
-        </div>
+        </details>
+        <details style={{ ...styles.card, marginBottom: 14 }}>
+          <summary style={{ cursor: 'pointer' }}>
+            <strong>Colored structures</strong>
+            <div style={{ ...styles.muted, fontSize: 11, marginTop: 2 }}>
+              {coloredStructures.length} structure
+              {coloredStructures.length === 1 ? '' : 's'} recolored
+            </div>
+          </summary>
 
+          {coloredStructures.map((structure) => (
+            <div
+              key={structure.id}
+              style={{
+                padding: '9px 0',
+                borderTop: '1px solid rgba(255,255,255,0.12)',
+              }}
+            >
+              <div style={{ marginBottom: 7 }}>
+                {structure.displayLabel}
+              </div>
+
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                {COLOR_OPTIONS.map(([label, color]) => (
+                  <button
+                    key={color}
+                    type="button"
+                    title={label}
+                    onClick={() => setStructureColor(structure, color)}
+                    style={{
+                      ...styles.button,
+                      width: color === 'original' ? 'auto' : 24,
+                      height: 24,
+                      padding: color === 'original' ? '2px 7px' : 0,
+                      background:
+                        color === 'original'
+                          ? styles.button.background
+                          : color,
+                    }}
+                  >
+                    {color === 'original' ? 'Original' : ''}
+                  </button>
+                ))}
+              </div>
+            </div>
+          ))}
+        </details>
         <div style={{ ...styles.card, marginBottom: 14 }}>
           <span>
             <strong>Selected structures</strong>
@@ -1915,7 +2133,141 @@ function App() {
             onRemove={(structure) => removeSelectedId(structure.id)}
           />
         </div>
+        <div style={{ ...styles.card, marginBottom: 14 }}>
+          <strong>Custom groups</strong>
 
+          <div
+            style={{
+              display: 'flex',
+              gap: 6,
+              marginTop: 9,
+              marginBottom: 10,
+            }}
+          >
+            <input
+              value={newGroupName}
+              onChange={(event) => setNewGroupName(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') createCustomGroup()
+              }}
+              placeholder="New group name"
+              style={styles.input}
+            />
+
+            <button
+              type="button"
+              onClick={createCustomGroup}
+              style={styles.button}
+            >
+              Add
+            </button>
+          </div>
+
+          {Object.entries(customGroups).map(([groupName, ids]) => {
+            const groupStructures = structures.filter((structure) =>
+              ids.has(structure.id)
+            )
+
+            return (
+              <details key={groupName}>
+                <summary style={{ cursor: 'pointer', padding: '7px 0' }}>
+                  {groupName} ({groupStructures.length})
+                </summary>
+
+                <div
+                  style={{
+                    display: 'flex',
+                    flexWrap: 'wrap',
+                    gap: 5,
+                    marginBottom: 8,
+                  }}
+                >
+                  <button
+                    type="button"
+                    onClick={() => selectCustomGroup(groupName)}
+                    style={styles.button}
+                  >
+                    Select all
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => hideCustomGroup(groupName)}
+                    style={styles.button}
+                  >
+                    Hide
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => showCustomGroup(groupName)}
+                    style={styles.button}
+                  >
+                    Show
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => showOnlyCustomGroup(groupName)}
+                    style={styles.button}
+                  >
+                    Show only
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => deleteCustomGroup(groupName)}
+                    style={styles.button}
+                  >
+                    Delete
+                  </button>
+                </div>
+
+                {groupStructures.map((structure) => (
+                  <div
+                    key={structure.id}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      gap: 8,
+                      padding: '6px 0',
+                      borderTop: '1px solid rgba(255,255,255,0.1)',
+                    }}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSelectedStructure(structure)
+                        toggleSelectedId(structure.id)
+                      }}
+                      style={{
+                        border: 0,
+                        padding: 0,
+                        color: 'white',
+                        background: 'transparent',
+                        textAlign: 'left',
+                        cursor: 'pointer',
+                      }}
+                    >
+                      {structure.displayLabel}
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() =>
+                        removeStructureFromGroup(groupName, structure.id)
+                      }
+                      style={{ ...styles.button, padding: '3px 7px' }}
+                    >
+                      Remove
+                    </button>
+                  </div>
+                ))}
+              </details>
+            )
+          })}
+        </div>
         <StructureDetails
           structure={selectedStructure}
           isHidden={selectedStructure ? hiddenIds.has(selectedStructure.id) : false}
@@ -1931,6 +2283,10 @@ function App() {
             setSelectedStructure(null)
             setHoveredId(null)
           }}
+          customGroups={customGroups}
+          onAddToGroup={(groupName) =>
+            addStructureToGroup(groupName, structure.id)
+          }
         />
       </aside>
     </div>
